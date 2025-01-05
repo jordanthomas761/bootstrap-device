@@ -6,18 +6,18 @@
   - name: Copy MOTD
     become: true
     become_method: sudo
-    copy:
+    ansible.builtin.copy:
       src: raspberry-pi-motd
       dest: /etc/update-motd.d/51-raspberry-pi-motd
       mode: +x
   - name: check MOTD
-    slurp:
+    ansible.builtin.slurp:
       src: /etc/motd
     register: motd_value
   - name: Erase Default MOTD
     become: true
     become_method: sudo
-    copy:
+    ansible.builtin.copy:
       content: ""
       dest: /etc/motd
     when: motd_value != ""
@@ -35,26 +35,26 @@
       - name: install zsh
         become: true
         become_method: sudo
-        apt: 
+        ansible.builtin.apt: 
           name: zsh
           state: latest
       - name: Check for Oh-My-Zsh
-        stat:
+        ansible.builtin.stat:
           path: ~/.oh-my-zsh
         register: omz
       - name: Install Oh-My-Zsh
-        shell:
+        ansible.builtin.shell:
           cmd: sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
         when: not omz.stat.exists
       - name: Change Theme
-        replace:
+        ansible.builtin.replace:
           path: ~/.zshrc
           regexp: ZSH_THEME="robbyrussell"
           replace: ZSH_THEME="alanpeabody"
       - name: Change shell
         become: true
         become_method: sudo
-        user:
+        ansible.builtin.user:
           name: '{{ ansible_user_id }}'
           shell: /bin/zsh  
   - name: Setup xRDP
@@ -62,13 +62,13 @@
       - name: install xRDP
         become: true
         become_method: sudo
-        apt: 
+        ansible.builtin.apt: 
           name: xrdp
           state: latest
       - name: add xrdp to ssl-cert group
         become: true
         become_method: sudo
-        user:
+        ansible.builtin.user:
           name: '{{ ansible_user_id }}'
           append: true
           groups: 
@@ -90,7 +90,7 @@
       - name: add user
         become: true
         become_method: sudo
-        user:
+        ansible.builtin.user:
           name: '{{ ansible_user_id }}'
           append: true
           groups: 
