@@ -10,16 +10,22 @@
       src: raspberry-pi-motd
       dest: /etc/update-motd.d/51-raspberry-pi-motd
       mode: +x
+  - name: check MOTD
+    slurp:
+      src: /etc/motd
+    register: motd_value
+  - name: Erase Default MOTD
+    become: true
+    become_method: sudo
+    copy:
+      content: ""
+      dest: /etc/motd
+    when: motd_value != ""
 
 - name: Initial machine setup
   hosts: all
 
   tasks:
-  - name: Update apt-cache
-    become: true
-    become_method: sudo
-    apt:
-      update_cache: true
   - name: Setup Git 
     apt: 
       name: git
