@@ -5,8 +5,10 @@
     - name: Copy MOTD
       become: true
       become_method: ansible.builtin.sudo
+      vars:
+        source_path: raspberry-pi-motd
       ansible.builtin.copy:
-        src: "{{ source_path }}/files/raspberry-pi-motd"
+        src: "{{ source_path }}"
         dest: /etc/update-motd.d/51-raspberry-pi-motd
         mode: +x
     - name: Check MOTD

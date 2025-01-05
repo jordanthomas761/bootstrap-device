@@ -1,6 +1,4 @@
 ---
-- galaxy_info:
-  standalone: false
 
 - name: Include Raspberry-Pi MOTD.
   ansible.builtin.import_playbook: playbooks/raspberry-pi-motd.yml
@@ -8,13 +6,14 @@
 - name: Initial machine setup
   hosts: all
 
+
   tasks:
     - name: Setup Git
       ansible.builtin.apt:
         name: git
     - name: Setup Zsh
       block:
-        - name: Install Xsh
+        - name: Install Zsh
           become: true
           become_method: ansible.builtin.sudo
           ansible.builtin.apt:
@@ -56,8 +55,10 @@
         - name: Allow users to use Colord
           become: true
           become_method: ansible.builtin.sudo
+          vars:
+            source_path: 45-allow-colord.pkla
           ansible.builtin.copy:
-            src: ../files/45-allow-colord.pkla
+            src: "{{ source_path }}"
             dest: /etc/polkit-1/localauthority/50-local.d/
             mode: "0644"
     - name: Ensure Snapd installed.
@@ -66,4 +67,4 @@
         name: snapd
 
 - name: Include MicroK8s.
-  ansible.builtin.import_playbook: playbook/microk8s.yml
+  ansible.builtin.import_playbook: playbooks/microk8s.yml
