@@ -1,0 +1,67 @@
+---
+- name: Initial setup raspberry-pis
+  hosts: ubuntu-vm
+
+  tasks:
+  - name: Copy MOTD
+    become: true
+    become_method: sudo
+    copy:
+      src: raspberry-pi-motd
+      dest: /etc/update-motd.d/51-raspberry-pi-motd
+      mode: +x
+  - name: Setup Git 
+    apt: 
+      name: git
+      state: latest
+  - name: Setup Zsh
+    block: 
+      - name: install zsh
+        become: true
+        become_method: sudo
+        apt: 
+          name: zsh
+          state: latest
+      - name: Install Oh-My-Zsh
+        shell:
+          cmd: sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
+        when: lookup('file', '~/.oh-my-zsh', errors='warn')
+      - name: Change Theme
+        replace:
+          path: ~/.zshrc
+          regexp: ZSH_THEME="robbyrussell"
+          replace: ZSH_THEME="alanpeabody"
+      - name: Change shell
+        become: true
+        become_method: sudo
+        user:
+          name: '{{ ansible_user_id }}'
+          shell: /bin/zsh  
+  - name: Setup xRDP
+    block: 
+      - name: install
+        apt: 
+          name: xrdp
+          state: latest
+      - name: add user
+        become: true
+        become_method: sudo
+        user:
+          name: '{{ ansible_user_id }}'
+          append: true
+          groups: 
+            - ssl-cert
+  - name: Ensure Snapd installed.
+    become: true
+    ansible.builtin.apt:
+      name: snapd
+      state: latest
+  - name: Setup MicroK8s
+    block:
+      - name: Install MicroK8s
+        become: true
+        become_method: sudo
+        community.general.snap:
+          name: microk8s
+          classic: true
+          state: present
