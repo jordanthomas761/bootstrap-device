@@ -25,6 +25,8 @@ UPTIME=$(printf "%d days, %02dh%02dm%02ds" "$days" "$hours" "$mins" "$secs")
 
 if /sbin/ifconfig end0 | /bin/grep -n "inet "; then
     local_ip=$(/sbin/ifconfig end0 | /bin/grep "inet ")
+el if /sbin/ifconfig eth0 | /bin/grep -n "inet "
+    local_ip=$(/sbin/ifconfig eth0 | /bin/grep "inet ")
 else 
     local_ip=$(/sbin/ifconfig wlan0 | /bin/grep "inet ")
 fi
