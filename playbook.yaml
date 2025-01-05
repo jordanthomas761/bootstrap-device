@@ -1,26 +1,6 @@
 ---
-- name: Raspberry-Pi MOTD
-  hosts: pis
-
-  tasks:
-  - name: Copy MOTD
-    become: true
-    become_method: sudo
-    ansible.builtin.copy:
-      src: raspberry-pi-motd
-      dest: /etc/update-motd.d/51-raspberry-pi-motd
-      mode: +x
-  - name: check MOTD
-    ansible.builtin.slurp:
-      src: /etc/motd
-    register: motd_value
-  - name: Erase Default MOTD
-    become: true
-    become_method: sudo
-    ansible.builtin.copy:
-      content: ""
-      dest: /etc/motd
-    when: motd_value != ""
+- name: Include Raspberry-Pi MOTD.
+  ansible.builtin.import_playbook: tasks/raspberry-pi-motd.yaml
 
 - name: Initial machine setup
   hosts: all
@@ -73,6 +53,12 @@
           append: true
           groups: 
             - ssl-cert
+      - name: Allow users to use Colord
+        become: true
+        become_method: sudo
+        ansible.builtin.copy:
+          src: ../files/45-allow-colord.pkla
+          dest: /etc/polkit-1/localauthority/50-local.d/
   - name: Ensure Snapd installed.
     become: true
     ansible.builtin.apt:
