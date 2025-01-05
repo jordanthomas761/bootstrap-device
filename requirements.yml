@@ -2,3 +2,6 @@ collections:
   - name: community.general
     version: ">=7.0.0"
     source: https://galaxy.ansible.com
+# roles:
+#   - name: ctorgalson.oh-my-zsh
+#     version: "v2.3.1"

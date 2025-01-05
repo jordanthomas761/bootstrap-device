@@ -37,6 +37,15 @@
           ansible.builtin.user:
             name: '{{ ansible_user_id }}'
             shell: /bin/zsh
+        # - name: Run ansible-role-oh-my-zsh.
+        #   include_role:
+        #     name: "ansible-role-oh-my-zsh"
+        #   vars:
+        #     omz_user: "{{ ansible_user_id }}"
+        #     omz_plugins:
+        #       - "autojump"
+        #       - "git"
+        #     omz_zsh_theme: alanpeabody
     - name: Setup xRDP
       block:
         - name: Install xRDP
