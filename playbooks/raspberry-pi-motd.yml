@@ -1,0 +1,23 @@
+- name: Raspberry-Pi MOTD
+  hosts: pis
+
+  tasks:
+    - name: Copy MOTD
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.copy:
+        src: "{{ source_path }}/files/raspberry-pi-motd"
+        dest: /etc/update-motd.d/51-raspberry-pi-motd
+        mode: +x
+    - name: Check MOTD
+      ansible.builtin.slurp:
+        src: /etc/motd
+      register: motd_value
+    - name: Erase Default MOTD
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.copy:
+        content: ""
+        dest: /etc/motd
+        mode: "0644"
+      when: motd_value != ""

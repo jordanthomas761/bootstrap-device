@@ -1,0 +1,69 @@
+---
+- galaxy_info:
+  standalone: false
+
+- name: Include Raspberry-Pi MOTD.
+  ansible.builtin.import_playbook: playbooks/raspberry-pi-motd.yml
+
+- name: Initial machine setup
+  hosts: all
+
+  tasks:
+    - name: Setup Git
+      ansible.builtin.apt:
+        name: git
+    - name: Setup Zsh
+      block:
+        - name: Install Xsh
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.apt:
+            name: zsh
+        - name: Check for Oh-My-Zsh
+          ansible.builtin.stat:
+            path: ~/.oh-my-zsh
+          register: omz
+        - name: Install Oh-My-Zsh
+          ansible.builtin.shell:
+            cmd: sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
+          when: not omz.stat.exists
+        - name: Change Theme
+          ansible.builtin.replace:
+            path: ~/.zshrc
+            regexp: ZSH_THEME="robbyrussell"
+            replace: ZSH_THEME="alanpeabody"
+        - name: Change shell
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.user:
+            name: '{{ ansible_user_id }}'
+            shell: /bin/zsh
+    - name: Setup xRDP
+      block:
+        - name: Install xRDP
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.apt:
+            name: xrdp
+        - name: Add xRSP to SSL-Cert Group
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.user:
+            name: '{{ ansible_user_id }}'
+            append: true
+            groups:
+              - ssl-cert
+        - name: Allow users to use Colord
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.copy:
+            src: ../files/45-allow-colord.pkla
+            dest: /etc/polkit-1/localauthority/50-local.d/
+            mode: "0644"
+    - name: Ensure Snapd installed.
+      become: true
+      ansible.builtin.apt:
+        name: snapd
+
+- name: Include MicroK8s.
+  ansible.builtin.import_playbook: playbook/microk8s.yml

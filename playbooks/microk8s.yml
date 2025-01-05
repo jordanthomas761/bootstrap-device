@@ -1,0 +1,19 @@
+- name: Setup MicroK8s
+  hosts: pis
+
+  tasks:
+    - name: Install MicroK8s
+      become: true
+      become_method: ansible.builtin.sudo
+      community.general.snap:
+        name: microk8s
+        classic: true
+        state: present
+    - name: Add User
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.user:
+        name: '{{ ansible_user_id }}'
+        append: true
+        groups:
+          - microk8s
