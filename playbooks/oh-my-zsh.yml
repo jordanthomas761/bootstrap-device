@@ -1,0 +1,37 @@
+- name: Setup Oh-My-Zsh
+  hosts: all
+
+  tasks:
+    - name: Install Zsh
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: zsh
+    - name: Check for Oh-My-Zsh
+      ansible.builtin.stat:
+        path: ~/.oh-my-zsh
+      register: omz
+    - name: Install Oh-My-Zsh
+      ansible.builtin.shell:
+        cmd: sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
+      when: not omz.stat.exists
+    - name: Change Theme
+      ansible.builtin.replace:
+        path: ~/.zshrc
+        regexp: ZSH_THEME="robbyrussell"
+        replace: ZSH_THEME="alanpeabody"
+    - name: Change shell
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.user:
+        name: '{{ ansible_user_id }}'
+        shell: /bin/zsh
+    # - name: Run ansible-role-oh-my-zsh.
+    #   include_role:
+    #     name: "ansible-role-oh-my-zsh"
+    #   vars:
+    #     omz_user: "{{ ansible_user_id }}"
+    #     omz_plugins:
+    #       - "autojump"
+    #       - "git"
+    #     omz_zsh_theme: alanpeabody
