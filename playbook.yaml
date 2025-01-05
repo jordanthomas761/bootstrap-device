@@ -1,6 +1,6 @@
 ---
-- name: Initial setup raspberry-pis
-  hosts: ubuntu-vm
+- name: Raspberry-Pi MOTD
+  hosts: pis
 
   tasks:
   - name: Copy MOTD
@@ -10,6 +10,16 @@
       src: raspberry-pi-motd
       dest: /etc/update-motd.d/51-raspberry-pi-motd
       mode: +x
+
+- name: Initial machine setup
+  hosts: all
+
+  tasks:
+  - name: Update apt-cache
+    become: true
+    become_method: sudo
+    apt:
+      update_cache: true
   - name: Setup Git 
     apt: 
       name: git
@@ -22,10 +32,14 @@
         apt: 
           name: zsh
           state: latest
+      - name: Check for Oh-My-Zsh
+        stat:
+          path: ~/.oh-my-zsh
+        register: omz
       - name: Install Oh-My-Zsh
         shell:
           cmd: sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
-        when: lookup('file', '~/.oh-my-zsh', errors='warn')
+        when: not omz.stat.exists
       - name: Change Theme
         replace:
           path: ~/.zshrc
@@ -39,11 +53,13 @@
           shell: /bin/zsh  
   - name: Setup xRDP
     block: 
-      - name: install
+      - name: install xRDP
+        become: true
+        become_method: sudo
         apt: 
           name: xrdp
           state: latest
-      - name: add user
+      - name: add xrdp to ssl-cert group
         become: true
         become_method: sudo
         user:
@@ -65,3 +81,11 @@
           name: microk8s
           classic: true
           state: present
+      - name: add user
+        become: true
+        become_method: sudo
+        user:
+          name: '{{ ansible_user_id }}'
+          append: true
+          groups: 
+            - microk8s
