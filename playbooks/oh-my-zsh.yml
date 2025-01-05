@@ -15,6 +15,7 @@
       ansible.builtin.shell:
         cmd: sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh) --unattended"
       when: not omz.stat.exists
+      changed_when: true
     - name: Change Theme
       ansible.builtin.replace:
         path: ~/.zshrc
