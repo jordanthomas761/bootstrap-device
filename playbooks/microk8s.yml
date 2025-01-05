@@ -1,5 +1,5 @@
 - name: Setup MicroK8s
-  hosts: pis
+  hosts: all
 
   tasks:
     - name: Install MicroK8s
