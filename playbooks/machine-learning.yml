@@ -1,0 +1,26 @@
+- name: Setup Machine Learning
+  hosts: ml
+
+  tasks:
+    - name: Update Cache
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        update_cache: true
+    - name: Install Halio
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: hailo-all
+    - name: Install RPICam
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: rpicam-apps
+    - name: Change PCI-E Speeds
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.lineinfile:
+        path: /boot/firmware/config.txt
+        search_string: "dtparam=pciex1_gen=3"
+        line: "dtparam=pciex1_gen=3"
