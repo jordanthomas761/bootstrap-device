@@ -23,3 +23,14 @@
         dest: /etc/motd
         mode: "0644"
       when: motd_value != ""
+    - name: Check env file groups
+      ansible.builtin.shell: grep -c 'PATH' /etc/environment || true
+      changed_when: false
+      register: env_file
+    - name: Append Groups
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        line: PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games"
+      when: env_file.stdout == "0"

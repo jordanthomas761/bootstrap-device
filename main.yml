@@ -4,7 +4,7 @@
   ansible.builtin.import_playbook: playbooks/raspberry-pi-motd.yml
 
 - name: Initial machine setup
-  hosts: all
+  hosts: pis
 
   tasks:
     - name: Setup Git
@@ -38,6 +38,19 @@
       become: true
       ansible.builtin.apt:
         name: snapd
+    - name: Check env file groups
+      ansible.builtin.shell: grep -c ':/snap/bin' /etc/environment || true
+      changed_when: false
+      register: env_snap
+    - name: Append snap
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: "^(PATH=\".*)(\")$"
+        line: '\1:/snap/bin\2'
+        backrefs: true
+      when: env_snap.stdout == "0"
 
 - name: Include Oh-My-ZSH.
   ansible.builtin.import_playbook: playbooks/oh-my-zsh.yml

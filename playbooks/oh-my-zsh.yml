@@ -1,5 +1,5 @@
 - name: Setup Oh-My-Zsh
-  hosts: all
+  hosts: pis
 
   tasks:
     - name: Install Zsh
