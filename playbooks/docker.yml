@@ -4,74 +4,87 @@
   hosts: pis
 
   tasks:
-    - name: Remove conflicting Docker packages
-      become: true
-      ansible.builtin.apt:
-        name:
-          - docker.io
-          - docker-compose
-          - docker-doc
-          - podman-docker
-          - containerd
-          - runc
-        state: absent
-        purge: true
+    - name: Gather package facts
+      ansible.builtin.package_facts:
+        manager: auto
 
-    - name: Update apt cache
-      become: true
-      ansible.builtin.apt:
-        update_cache: true
-        cache_valid_time: 3600
+    # - name: Save package facts to file
+    #   ansible.builtin.copy:
+    #     dest: /tmp/package_facts.json
+    #     content: "{{ ansible_facts.packages | to_nice_json }}"
+    #     mode: "0644"
 
-    - name: Install Docker dependencies
-      become: true
-      ansible.builtin.apt:
-        name:
-          - apt-transport-https
-          - ca-certificates
-          - curl
-          - gnupg
-          - lsb-release
-        state: present
+    - name: Install Docker when not present
+      when: "'docker.io' not in ansible_facts.packages"
+      block:
+        - name: Remove conflicting Docker packages
+          become: true
+          ansible.builtin.apt:
+            name:
+              - docker.io
+              - docker-compose
+              - docker-doc
+              - podman-docker
+              - containerd
+              - runc
+            state: absent
+            purge: true
 
-    - name: Add Docker GPG key
-      become: true
-      ansible.builtin.apt_key:
-        url: https://download.docker.com/linux/raspbian/gpg
-        state: present
+        - name: Update apt cache
+          become: true
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
 
-    - name: Add Docker repository
-      become: true
-      ansible.builtin.apt_repository:
-        repo: "deb [arch=armhf] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
-        state: present
-        filename: docker
+        - name: Install Docker dependencies
+          become: true
+          ansible.builtin.apt:
+            name:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+            state: present
 
-    - name: Install Docker
-      become: true
-      ansible.builtin.apt:
-        name: docker-ce
-        state: present
+        - name: Add Docker GPG key
+          become: true
+          ansible.builtin.apt_key:
+            url: https://download.docker.com/linux/raspbian/gpg
+            state: present
 
-    - name: Install Docker Compose
-      become: true
-      ansible.builtin.apt:
-        name: docker-compose
-        state: present
+        - name: Add Docker repository
+          become: true
+          ansible.builtin.apt_repository:
+            repo: "deb [arch=armhf] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+            state: present
+            filename: docker
 
-    - name: Start Docker service
-      become: true
-      ansible.builtin.systemd:
-        name: docker
-        state: started
-        enabled: true
+        - name: Install Docker
+          become: true
+          ansible.builtin.apt:
+            name: docker-ce
+            state: present
 
-    - name: Add user to docker group
-      become: true
-      ansible.builtin.user:
-        name: "{{ ansible_user_id }}"
-        groups: docker
-        append: true
+        - name: Install Docker Compose
+          become: true
+          ansible.builtin.apt:
+            name: docker-compose
+            state: present
 
-    - name: Reset SSH connection to apply new group membership
-      ansible.builtin.meta: reset_connection
+        - name: Start Docker service
+          become: true
+          ansible.builtin.systemd:
+            name: docker
+            state: started
+            enabled: true
+
+        - name: Add user to docker group
+          become: true
+          ansible.builtin.user:
+            name: "{{ ansible_user_id }}"
+            groups: docker
+            append: true
+
+        - name: Reset SSH connection to apply new group membership
+          ansible.builtin.meta: reset_connection
