@@ -1,0 +1,45 @@
+---
+
+- name: Install OpenVPN
+  hosts: pis
+
+  tasks:
+    - name: Update apt cache
+      become: true
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install OpenVPN
+      become: true
+      ansible.builtin.apt:
+        name:
+          - openvpn
+          - openvpn-systemd-resolved
+        state: present
+
+    - name: Create OpenVPN client config directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/openvpn/client
+        state: directory
+        mode: "0755"
+
+    - name: Create OpenVPN log directory
+      become: true
+      ansible.builtin.file:
+        path: /var/log/openvpn
+        state: directory
+        mode: "0755"
+
+    - name: Enable OpenVPN systemd service
+      become: true
+      ansible.builtin.systemd:
+        name: openvpn-client@client
+        enabled: false
+      notify: OpenVPN service status
+
+  handlers:
+    - name: OpenVPN service status
+      ansible.builtin.debug:
+        msg: "OpenVPN installed. Place your .ovpn config in /etc/openvpn/client/ and enable with: sudo systemctl enable --now openvpn-client@<config-name>"

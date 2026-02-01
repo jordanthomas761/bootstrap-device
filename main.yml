@@ -60,3 +60,6 @@
 
 - name: Include MicroK8s.
   ansible.builtin.import_playbook: playbooks/microk8s.yml
+
+- name: Include OpenVPN.
+  ansible.builtin.import_playbook: playbooks/openvpn.yml
