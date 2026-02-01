@@ -55,5 +55,8 @@
 - name: Include Oh-My-ZSH.
   ansible.builtin.import_playbook: playbooks/oh-my-zsh.yml
 
+- name: Include Docker.
+  ansible.builtin.import_playbook: playbooks/docker.yml
+
 - name: Include MicroK8s.
   ansible.builtin.import_playbook: playbooks/microk8s.yml
