@@ -8,6 +8,8 @@
 
   tasks:
     - name: Setup Git
+      become: true
+      become_method: ansible.builtin.sudo
       ansible.builtin.apt:
         name: git
     - name: Setup xRDP
