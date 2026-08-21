@@ -101,6 +101,11 @@
           data:
             url: "{{ argocd_external_url }}"
 
+    # This playbook owns and fully overwrites the policy.csv/policy.default
+    # keys (not additive) — the merge patch only replaces these two keys, so
+    # other argocd-rbac-cm data keys are left alone, but any RBAC rule beyond
+    # the Dex admin group mapping must be added here, not applied out-of-band,
+    # or it'll get clobbered the next time this playbook runs.
     - name: Patch argocd-rbac-cm with the Dex admin group mapping
       become: true
       become_method: ansible.builtin.sudo
