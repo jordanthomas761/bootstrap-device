@@ -1,0 +1,31 @@
+---
+- name: Update apt cache
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Disable swap
+  ansible.builtin.import_tasks: swap.yml
+
+- name: Load required kernel modules
+  ansible.builtin.import_tasks: kernel_modules.yml
+
+- name: Configure required sysctl settings
+  ansible.builtin.import_tasks: sysctl.yml
+
+- name: Install conntrack
+  ansible.builtin.import_tasks: conntrack.yml
+
+- name: Ensure time sync is enabled
+  ansible.builtin.import_tasks: time_sync.yml
+
+- name: Ensure port 10250 is free for kubelet
+  ansible.builtin.import_tasks: port_10250.yml
+
+- name: Install and configure containerd
+  ansible.builtin.import_tasks: containerd.yml
+
+- name: Install kubeadm, kubelet, and kubectl
+  ansible.builtin.import_tasks: kube_packages.yml

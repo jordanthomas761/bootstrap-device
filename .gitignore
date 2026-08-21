@@ -1,0 +1,8 @@
+# Ansible Galaxy local cache/lock (roles/collections are reinstalled via requirements.yml)
+.ansible/
+
+# macOS
+.DS_Store
+
+# Ansible retry files
+*.retry

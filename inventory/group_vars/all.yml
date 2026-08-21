@@ -1,0 +1,7 @@
+---
+kubernetes_series: "1.31"
+# Exact package version+revision pinned identically across control_plane and workers.
+# Find the right string with: apt-cache madison kubeadm  (after the kubernetes apt repo is added)
+kubernetes_package_version: "1.31.4-1.1"
+# Derived for --kubernetes-version on kubeadm init/join — kept in sync with the pin above automatically.
+kubernetes_version: "v{{ kubernetes_package_version.split('-')[0] }}"

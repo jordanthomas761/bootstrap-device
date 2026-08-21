@@ -1,0 +1,26 @@
+---
+- name: Disable swap.img via fstab (Ubuntu Server control plane)
+  when: "'control_plane' in group_names"
+  become: true
+  become_method: ansible.builtin.sudo
+  block:
+    - name: Comment out swap.img entry in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#\n].*\bswap\.img\b.*)$'
+        replace: '# \1'
+
+    - name: Turn off any active swap
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+      when: ansible_swaptotal_mb | default(0) > 0
+
+- name: Disable zram swap (Raspberry Pi OS workers)
+  when: "'workers' in group_names"
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.systemd:
+    name: systemd-zram-setup@zram0.service
+    state: stopped
+    enabled: false
+    masked: true

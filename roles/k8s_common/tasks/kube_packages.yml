@@ -1,0 +1,59 @@
+---
+- name: Install apt prerequisites for the Kubernetes repo
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - python3-debian
+    state: present
+
+- name: Add Kubernetes apt repository
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.deb822_repository:
+    name: kubernetes
+    types: deb
+    uris: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/"
+    suites: /
+    signed_by: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/Release.key"
+    # trusted works around pkgs.k8s.io's InRelease using an old v3-format signature
+    # that newer sqv verifiers reject past the 2026-02-01 policy cutoff.
+    trusted: true
+  notify: Update Kubernetes apt cache
+
+- name: Apply pending Kubernetes apt cache update
+  ansible.builtin.meta: flush_handlers
+
+- name: Install kubelet, kubeadm, and kubectl (pinned)
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    name:
+      - "kubelet={{ kubernetes_package_version }}"
+      - "kubeadm={{ kubernetes_package_version }}"
+      - "kubectl={{ kubernetes_package_version }}"
+    state: present
+    allow_downgrade: true
+
+- name: Hold kubelet, kubeadm, and kubectl at the pinned version
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Ensure kubelet is enabled
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+    state: started

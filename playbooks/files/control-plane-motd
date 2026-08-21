@@ -1,0 +1,31 @@
+#!/usr/bin/env sh
+
+upSeconds="$(/usr/bin/cut -d. -f1 /proc/uptime)"
+secs=$((upSeconds%60))
+mins=$((upSeconds/60%60))
+hours=$((upSeconds/3600%24))
+days=$((upSeconds/86400))
+free_memory=$(cat /proc/meminfo | grep MemAvailable | awk {'print $2'})
+total_memory=$(cat /proc/meminfo | grep MemTotal | awk {'print $2'})
+PERCENT_MEM=$(awk -v used="$((total_memory-free_memory))" -v total="$total_memory" 'BEGIN { printf "%.2f", (used/total)*100 }')
+UPTIME=$(printf "%d days, %02dh%02dm%02ds" "$days" "$hours" "$mins" "$secs")
+
+local_ip=$(ip -4 route get 1 2> /dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+[ -z "$local_ip" ] && local_ip=$(hostname -I | awk '{print $1}')
+
+# get the load averages
+read one five fifteen rest < /proc/loadavg
+
+printf "\e[0;36m
+          .-'''''-.
+       .'  \\  |  /  '.    $(date +"%A, %e %B %Y, %r")
+      /     \\ | /     \\   $(uname -srmo)\e[m\e[0;34m
+     |    ---( o )---    |
+      \\     / | \\     /
+       '.  /   \\  '.'
+          '-.....-'       Uptime.............: ${UPTIME}
+           /  | |  \\      Memory.............: $(printf "%.2f" "$PERCENT_MEM")%% of $((total_memory/1000/1000))GB (Total)
+          /   | |   \\     Load Averages......: ${one}, ${five}, ${fifteen} (1, 5, 15 min)
+                          Running Processes..: $(ps ax | wc -l | tr -d " ")
+                          IP Address.........: ${local_ip}
+\e[m"

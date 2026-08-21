@@ -1,0 +1,26 @@
+---
+- name: Check for snap binary
+  ansible.builtin.stat:
+    path: /usr/bin/snap
+  register: k8s_common_snap_bin
+
+- name: Check if MicroK8s is installed via snap
+  ansible.builtin.command: snap list microk8s
+  register: k8s_common_microk8s_snap_check
+  failed_when: false
+  changed_when: false
+  when: k8s_common_snap_bin.stat.exists
+
+- name: Remove MicroK8s (its kubelite process squats on port 10250)
+  become: true
+  become_method: ansible.builtin.sudo
+  community.general.snap:
+    name: microk8s
+    state: absent
+  when: k8s_common_snap_bin.stat.exists and k8s_common_microk8s_snap_check.rc == 0
+
+- name: Verify port 10250 is free
+  ansible.builtin.wait_for:
+    port: 10250
+    state: stopped
+    timeout: 5

@@ -1,0 +1,21 @@
+---
+- name: Ensure systemd-timesyncd is installed
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    name: systemd-timesyncd
+    state: present
+
+- name: Ensure systemd-timesyncd is enabled and running
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.systemd:
+    name: systemd-timesyncd
+    enabled: true
+    state: started
+
+- name: Ensure NTP sync is enabled
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: timedatectl set-ntp true
+  changed_when: false
