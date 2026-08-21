@@ -7,9 +7,9 @@
 # of main.yml's automatic bootstrap chain, since Dex itself is only deployed
 # once GitOps takes over (applying homelab-infra's root-app.yaml), which
 # happens after this playbook, not before it. The client-secret var lives in
-# inventory/vault/argocd_dex.yml (gitignored, ansible-vault encrypted — copy
-# it from inventory/vault/argocd_dex.yml.example first, see that file for
-# one-time setup) and must be passed explicitly:
+# inventory/vault/argocd_dex.yml (tracked in git, already ansible-vault
+# encrypted — see README.md's Ansible Vault section to rotate it) and must
+# be passed explicitly:
 #
 #   ansible-playbook -i inventory/hosts.yml \
 #     -e @inventory/vault/argocd_dex.yml \
@@ -27,11 +27,12 @@
           - argocd_dex_client_secret != "PLACEHOLDER_REPLACE_ME"
           - argocd_dex_client_secret | length > 0
         fail_msg: >-
-          argocd_dex_client_secret is unset or still the placeholder. Copy
-          inventory/vault/argocd_dex.yml.example to
-          inventory/vault/argocd_dex.yml, generate one (openssl rand -hex
-          32), encrypt it with ansible-vault, and seal the SAME value into
-          homelab-infra's
+          argocd_dex_client_secret is unset or still the placeholder. Either
+          -e @inventory/vault/argocd_dex.yml and --vault-password-file
+          weren't passed, or the secret needs rotating: see README.md's
+          Ansible Vault section (copy argocd_dex.yml.example, generate one
+          with openssl rand -hex 32, encrypt it with ansible-vault), and
+          seal the SAME value into homelab-infra's
           apps/dex-config/manifests/oidc-client-secrets-sealedsecret.yaml
           under ARGOCD_CLIENT_SECRET — see that file's header for the
           kubeseal command.

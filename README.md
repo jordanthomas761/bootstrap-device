@@ -82,12 +82,18 @@ sides first (see below).
 
 ### Ansible Vault
 
-The Dex OIDC client secret is meant to live ansible-vault-encrypted in
-`inventory/vault/argocd_dex.yml` — that path is gitignored (only
-`inventory/vault/argocd_dex.yml.example`, a template with no real secret, is
-tracked), so a real secret can never land in git unencrypted even by
-accident. It's also kept out of `group_vars`/`host_vars` on purpose, so
-unrelated playbook runs never need the vault password. One-time setup:
+The Dex OIDC client secret lives ansible-vault-encrypted (AES256) in
+`inventory/vault/argocd_dex.yml`, which is tracked in git already encrypted —
+`inventory/vault/argocd_dex.yml.example` remains as the plaintext-free
+template, both so a real secret can never land in git unencrypted and as the
+starting point for rotating the secret below. It's also kept out of
+`group_vars`/`host_vars` on purpose, so unrelated playbook runs never need
+the vault password. `.vault_pass.txt` itself stays gitignored and out of
+band (e.g. a password manager) — that's the only thing a fresh clone still
+needs to supply.
+
+To rotate the secret (or set it up from scratch if the vault file is ever
+missing):
 
 ```bash
 cp inventory/vault/argocd_dex.yml.example inventory/vault/argocd_dex.yml
