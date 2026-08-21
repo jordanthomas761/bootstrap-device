@@ -17,11 +17,11 @@ autoinstall:
     install-server: true
     allow-pw: false
     authorized-keys:
-      - "{{ lookup('file', ssh_pubkey_path) }}"
+      - "{{ lookup('file', ssh_pubkey_path) | trim }}"
   identity:
     hostname: "{{ control_plane_hostname }}"
     username: "{{ control_plane_username }}"
-    password: "{{ control_plane_password_hash.stdout }}"
+    password: "{{ control_plane_password_hash.stdout | trim }}"
   storage:
     layout:
       name: direct

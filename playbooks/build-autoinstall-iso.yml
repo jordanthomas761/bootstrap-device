@@ -16,8 +16,9 @@
     control_plane_hostname: control-plane
     control_plane_username: "{{ lookup('env', 'USER') }}"
     ssh_pubkey_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
-    build_dir: "{{ playbook_dir }}/../build/autoinstall-seed"
-    output_iso: "{{ playbook_dir }}/../build/autoinstall-seed.iso"
+    build_root: "{{ playbook_dir }}/../build"
+    build_dir: "{{ build_root }}/autoinstall-seed"
+    output_iso: "{{ build_root }}/autoinstall-seed.iso"
 
   vars_prompt:
     - name: control_plane_password
@@ -26,6 +27,19 @@
       confirm: true
 
   tasks:
+    - name: Verify this is running on macOS (hdiutil is required to build the ISO)
+      ansible.builtin.stat:
+        path: /usr/bin/hdiutil
+      register: k8s_autoinstall_hdiutil_stat
+
+    - name: Fail with a clear message if hdiutil is missing
+      ansible.builtin.fail:
+        msg: >-
+          hdiutil not found at /usr/bin/hdiutil — this playbook builds the
+          autoinstall seed ISO using macOS's built-in hdiutil and only runs
+          on macOS.
+      when: not k8s_autoinstall_hdiutil_stat.stat.exists
+
     - name: Verify SSH public key file exists
       ansible.builtin.stat:
         path: "{{ ssh_pubkey_path }}"
@@ -37,6 +51,12 @@
           No SSH public key found at {{ ssh_pubkey_path }}.
           Pass -e ssh_pubkey_path=/path/to/key.pub to point at a different one.
       when: not k8s_autoinstall_ssh_pubkey_stat.stat.exists
+
+    - name: Ensure build root directory exists with restrictive permissions
+      ansible.builtin.file:
+        path: "{{ build_root }}"
+        state: directory
+        mode: "0700"
 
     - name: Ensure build directory exists
       ansible.builtin.file:
@@ -71,12 +91,22 @@
 
     - name: Build the NoCloud seed ISO
       ansible.builtin.command:
-        cmd: >-
-          hdiutil makehybrid -iso -joliet
-          -default-volume-name cidata
-          -o {{ output_iso }}
-          {{ build_dir }}
+        argv:
+          - hdiutil
+          - makehybrid
+          - -iso
+          - -joliet
+          - -default-volume-name
+          - cidata
+          - -o
+          - "{{ output_iso }}"
+          - "{{ build_dir }}"
       changed_when: true
+
+    - name: Restrict permissions on the generated ISO
+      ansible.builtin.file:
+        path: "{{ output_iso }}"
+        mode: "0600"
 
     - name: Report output path
       ansible.builtin.debug:

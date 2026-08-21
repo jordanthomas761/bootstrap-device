@@ -44,7 +44,7 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 
 ## Unattended VM Install (Control Plane)
 
-For a UTM/QEMU control-plane VM, `playbooks/build-autoinstall-iso.yml` generates an Ubuntu Server 24.04 `autoinstall` seed ISO so the OS install itself requires no manual TUI steps:
+For a UTM/QEMU control-plane VM, `playbooks/build-autoinstall-iso.yml` generates an Ubuntu Server 24.04 `autoinstall` seed ISO so the OS installation requires no manual TUI steps:
 
 ```bash
 ansible-playbook playbooks/build-autoinstall-iso.yml
