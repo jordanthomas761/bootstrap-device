@@ -15,3 +15,6 @@
 # vault files are safe to force-add (git add -f) once ansible-vault encrypt
 # has actually been run on them.
 inventory/vault/*.yml
+
+# Autoinstall seed ISO build output (contains a password hash + SSH pubkey)
+/build/
