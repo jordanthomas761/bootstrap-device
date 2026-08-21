@@ -11,10 +11,15 @@
         src: "{{ source_path }}"
         dest: /etc/update-motd.d/51-control-plane-motd
         mode: +x
+    - name: Check if MOTD exists
+      ansible.builtin.stat:
+        path: /etc/motd
+      register: motd_stat
     - name: Check MOTD
       ansible.builtin.slurp:
         src: /etc/motd
       register: motd_value
+      when: motd_stat.stat.exists
     - name: Erase Default MOTD
       become: true
       become_method: ansible.builtin.sudo
@@ -22,7 +27,7 @@
         content: ""
         dest: /etc/motd
         mode: "0644"
-      when: (motd_value.content | b64decode) != ""
+      when: motd_stat.stat.exists and (motd_value.content | b64decode) != ""
     - name: Check env file groups
       ansible.builtin.shell: grep -c 'PATH' /etc/environment || true
       changed_when: false

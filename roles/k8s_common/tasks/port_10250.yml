@@ -24,3 +24,4 @@
     port: 10250
     state: stopped
     timeout: 5
+  when: k8s_common_snap_bin.stat.exists and k8s_common_microk8s_snap_check.rc == 0
