@@ -17,6 +17,8 @@
   when: not k8s_control_plane_cilium_cli_stat.stat.exists
 
 - name: Check if Cilium is already installed in the cluster
+  become: true
+  become_method: ansible.builtin.sudo
   ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get daemonset cilium
   register: k8s_control_plane_cilium_ds_check
   failed_when: false

@@ -1,20 +1,19 @@
 # Bootstrap Device
 
-An Ansible automation project for bootstrapping and configuring Raspberry Pi devices with development and infrastructure tools.
+An Ansible automation project for bootstrapping a small kubeadm Kubernetes cluster — one Ubuntu Server 24.04 control-plane VM and two Raspberry Pi 5 workers (Raspberry Pi OS, 64-bit) — plus general device provisioning (shell setup, remote desktop, ML tooling).
 
 ## Overview
 
-This project automates the setup of Raspberry Pi systems with a consistent configuration including remote desktop access, development tools, container orchestration, and shell customization.
+This project bootstraps a kubeadm-based Kubernetes cluster across a control-plane VM and Raspberry Pi worker nodes (containerd, kube-vip, Cilium), and layers on general device configuration: remote desktop access, development tools, and shell customization.
 
 ## Features
 
+- **Kubernetes cluster bootstrap**: kubeadm-based control plane (kube-vip for a stable VIP endpoint, Cilium as the CNI) and worker nodes, via the `k8s_common`/`k8s_control_plane`/`k8s_worker` roles
 - **Custom MOTD**: Distinct message-of-the-day for Raspberry Pi workers and the control-plane VM
 - **xRDP Remote Desktop**: Remote desktop access with SSL certificate configuration (workers)
 - **Development Tools**: Git and other essential development packages
 - **Oh-My-ZSH**: Popular ZSH shell framework for enhanced terminal experience (control plane + workers)
 - **Machine Learning**: Additional ML-related tooling and setup for designated worker(s)
-
-Kubernetes bootstrap (kubeadm, containerd, kube-vip) is being layered in as roles — see project notes for current status.
 
 ## Prerequisites
 
@@ -68,7 +67,13 @@ Kubernetes bootstrap (kubeadm, containerd, kube-vip) is being layered in as role
 ├── main.yml                      # Main playbook orchestrating all configurations
 ├── requirements.yml              # Ansible collection dependencies
 ├── inventory/
-│   └── hosts.yml                 # control_plane / workers / ml groups
+│   ├── hosts.yml                 # control_plane / workers / ml groups
+│   ├── group_vars/               # cluster-wide + per-group version pins, VIP, CIDR
+│   └── host_vars/                # per-worker vars (e.g. ML workload labeling)
+├── roles/
+│   ├── k8s_common/                # swap, kernel modules, containerd, kubeadm/kubelet/kubectl
+│   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI
+│   └── k8s_worker/                # kubeadm join
 ├── files/
 │   └── 45-allow-colord.pkla     # Polkit policy for Colord
 └── playbooks/

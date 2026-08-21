@@ -22,7 +22,7 @@
         content: ""
         dest: /etc/motd
         mode: "0644"
-      when: motd_value != ""
+      when: (motd_value.content | b64decode) != ""
     - name: Check env file groups
       ansible.builtin.shell: grep -c 'PATH' /etc/environment || true
       changed_when: false
