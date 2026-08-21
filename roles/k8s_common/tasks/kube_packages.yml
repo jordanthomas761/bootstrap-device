@@ -11,6 +11,37 @@
       - python3-debian
     state: present
 
+- name: Fetch Kubernetes apt signing key once
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.get_url:
+    # Fetched once from the control node and copied out below, rather than once
+    # per host, because pkgs.k8s.io's CloudFront WAF rate-limits/blocks bursts
+    # of requests from a single public IP (all hosts share one behind home NAT).
+    url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/Release.key"
+    dest: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
+    mode: "0644"
+  register: k8s_common_release_key_fetch
+  until: k8s_common_release_key_fetch is succeeded
+  retries: 5
+  delay: 15
+
+- name: Ensure apt keyrings directory exists
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install Kubernetes apt signing key
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.copy:
+    src: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: "0644"
+
 - name: Add Kubernetes apt repository
   become: true
   become_method: ansible.builtin.sudo
@@ -19,7 +50,7 @@
     types: deb
     uris: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/"
     suites: /
-    signed_by: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/Release.key"
+    signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.asc
     # trusted works around pkgs.k8s.io's InRelease using an old v3-format signature
     # that newer sqv verifiers reject past the 2026-02-01 policy cutoff.
     trusted: true
