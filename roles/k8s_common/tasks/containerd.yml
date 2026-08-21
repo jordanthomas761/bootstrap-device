@@ -40,6 +40,19 @@
     replace: '\1SystemdCgroup = true'
   notify: Restart containerd
 
+# containerd's own default (Debian's build in particular) points CNI bin_dir
+# at /usr/lib/cni, but Cilium installs its plugins (cilium-cni, loopback) to
+# /opt/cni/bin — left mismatched, every pod sandbox fails to create with
+# "failed to find plugin ... in path [/usr/lib/cni]".
+- name: Point containerd's CNI bin_dir at where Cilium installs its plugins
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^(\s*)bin_dir\s*=\s*".*"'
+    replace: '\1bin_dir = "/opt/cni/bin"'
+  notify: Restart containerd
+
 - name: Ensure containerd is enabled and running
   become: true
   become_method: ansible.builtin.sudo
