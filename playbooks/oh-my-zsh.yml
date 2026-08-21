@@ -1,5 +1,5 @@
 - name: Setup Oh-My-Zsh
-  hosts: pis
+  hosts: control_plane:workers
 
   tasks:
     - name: Install Zsh

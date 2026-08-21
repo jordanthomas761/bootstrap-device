@@ -1,0 +1,49 @@
+---
+- name: Install containerd
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    name: containerd
+    state: present
+
+- name: Check for existing containerd config
+  ansible.builtin.stat:
+    path: /etc/containerd/config.toml
+  register: k8s_common_containerd_config_stat
+
+- name: Read existing containerd config
+  ansible.builtin.slurp:
+    src: /etc/containerd/config.toml
+  register: k8s_common_containerd_config_raw
+  when: k8s_common_containerd_config_stat.stat.exists
+
+- name: Determine if containerd config needs (re)generating
+  ansible.builtin.set_fact:
+    k8s_common_containerd_config_needs_regen: >-
+      {{ not k8s_common_containerd_config_stat.stat.exists or
+         ((k8s_common_containerd_config_raw.content | b64decode) is search('disabled_plugins\s*=\s*\[[^\]]*"cri"[^\]]*\]')) }}
+
+- name: Generate clean containerd default config
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+  when: k8s_common_containerd_config_needs_regen
+  changed_when: true
+  notify: Restart containerd
+
+- name: Set SystemdCgroup = true in containerd config
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^(\s*)SystemdCgroup\s*=\s*false'
+    replace: '\1SystemdCgroup = true'
+  notify: Restart containerd
+
+- name: Ensure containerd is enabled and running
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started

@@ -1,15 +1,15 @@
-- name: Raspberry-Pi MOTD
-  hosts: workers
+- name: Control-Plane MOTD
+  hosts: control_plane
 
   tasks:
     - name: Copy MOTD
       become: true
       become_method: ansible.builtin.sudo
       vars:
-        source_path: raspberry-pi-motd
+        source_path: control-plane-motd
       ansible.builtin.copy:
         src: "{{ source_path }}"
-        dest: /etc/update-motd.d/51-raspberry-pi-motd
+        dest: /etc/update-motd.d/51-control-plane-motd
         mode: +x
     - name: Check MOTD
       ansible.builtin.slurp:

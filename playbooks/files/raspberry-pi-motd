@@ -24,13 +24,8 @@ UPTIME=$(printf "%d days, %02dh%02dm%02ds" "$days" "$hours" "$mins" "$secs")
 
 
 
-if ( /sbin/ifconfig end0 2> /dev/null | /bin/grep -q 'inet ' ); then
-    local_ip=$(/sbin/ifconfig end0 | /bin/grep 'inet ')
-elif /sbin/ifconfig eth0 2> /dev/null | /bin/grep -q 'inet '; then
-    local_ip=$(/sbin/ifconfig eth0 | /bin/grep 'inet ')
-else 
-    local_ip=$(/sbin/ifconfig wlan0 | /bin/grep 'inet ')
-fi
+local_ip=$(ip -4 route get 1 2> /dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+[ -z "$local_ip" ] && local_ip=$(hostname -I | awk '{print $1}')
 
 # get the load averages
 read one five fifteen rest < /proc/loadavg
@@ -43,7 +38,7 @@ printf "\e[0;32m
  ~ (   ) (   ) ~  Memory.............: $(printf "%.2f" "$PERCENT_MEM")%% of $((total_memory/1000/1000))GB (Total)
 ( : '~'.~.'~' : ) Load Averages......: ${one}, ${five}, ${fifteen} (1, 5, 15 min)
  ~ .~ (   ) ~. ~  Running Processes..: $(ps ax | wc -l | tr -d " ")
-  (  : '~' :  )   IP Addresses.......: $(echo "$local_ip" | /usr/bin/awk -F ' ' '{print $2}') and $(wget -q -O - http://icanhazip.com/ | tail)
+  (  : '~' :  )   IP Address.........: ${local_ip}
    '~ .~~~. ~'    Temp...............: $(vcgencmd measure_temp | awk -F '=' '{print $2}')
        '~'        Weather............: $(curl -s "http://rss.accuweather.com/rss/liveweather_rss.asp?metric=0&locCode=11210" | sed -n '/Currently:/ s/.*: \(.*\): \([0-9]*\)\([CF]\).*/\2°\3, \1/p')
 \e[m"

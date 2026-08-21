@@ -1,0 +1,16 @@
+---
+- name: Ensure /etc/kubernetes/manifests exists
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.file:
+    path: /etc/kubernetes/manifests
+    state: directory
+    mode: "0755"
+
+- name: Template kube-vip static pod manifest
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.template:
+    src: kube-vip.yaml.j2
+    dest: /etc/kubernetes/manifests/kube-vip.yaml
+    mode: "0644"

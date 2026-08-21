@@ -7,20 +7,51 @@
       become_method: ansible.builtin.sudo
       ansible.builtin.apt:
         update_cache: true
-    - name: Install Halio
+        cache_valid_time: 3600
+
+    - name: Install Hailo AI Kit stack
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.apt:
         name: hailo-all
+      notify: Reboot for Hailo AI Kit
+
     - name: Install RPICam
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.apt:
         name: rpicam-apps
-    - name: Change PCI-E Speeds
+
+    - name: Enable PCI-E Gen 3 speed
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.lineinfile:
         path: /boot/firmware/config.txt
         search_string: "dtparam=pciex1_gen=3"
         line: "dtparam=pciex1_gen=3"
+      notify: Reboot for Hailo AI Kit
+
+    - name: Apply pending Hailo AI Kit reboot
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify Hailo device is detected
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: hailortcli fw-control identify
+      register: hailo_identify
+      changed_when: false
+      until: hailo_identify.rc == 0
+      retries: 5
+      delay: 10
+
+    - name: Show Hailo identify output
+      ansible.builtin.debug:
+        msg: "{{ hailo_identify.stdout_lines }}"
+
+  handlers:
+    - name: Reboot for Hailo AI Kit
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.reboot:
+        msg: Rebooting to apply Hailo AI Kit driver / PCIe Gen 3 changes
+        reboot_timeout: 600

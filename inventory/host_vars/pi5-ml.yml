@@ -1,0 +1,4 @@
+---
+# Informational only — the actual node label is applied out-of-band via kubectl,
+# e.g. kubectl label node pi5-ml workload-type=ml
+workload_type: ml

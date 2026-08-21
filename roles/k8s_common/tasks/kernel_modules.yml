@@ -1,0 +1,24 @@
+---
+- name: Ensure k8s kernel modules load at boot
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+    mode: "0644"
+
+- name: Load overlay module
+  become: true
+  become_method: ansible.builtin.sudo
+  community.general.modprobe:
+    name: overlay
+    state: present
+
+- name: Load br_netfilter module
+  become: true
+  become_method: ansible.builtin.sudo
+  community.general.modprobe:
+    name: br_netfilter
+    state: present

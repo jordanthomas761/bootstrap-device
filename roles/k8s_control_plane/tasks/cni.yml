@@ -1,0 +1,47 @@
+---
+- name: Check if the Cilium CLI is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/cilium
+  register: k8s_control_plane_cilium_cli_stat
+
+- name: Download and install the Cilium CLI
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.unarchive:
+    src: >-
+      https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{
+      'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    mode: "0755"
+  when: not k8s_control_plane_cilium_cli_stat.stat.exists
+
+- name: Check if Cilium is already installed in the cluster
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get daemonset cilium
+  register: k8s_control_plane_cilium_ds_check
+  failed_when: false
+  changed_when: false
+
+- name: Install the Cilium CNI
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    cilium install --kubeconfig=/etc/kubernetes/admin.conf --version {{ cilium_version }}
+  when: k8s_control_plane_cilium_ds_check.rc != 0
+  changed_when: true
+
+- name: Wait for Cilium to report healthy
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: cilium status --kubeconfig=/etc/kubernetes/admin.conf --wait
+  register: k8s_control_plane_cilium_status
+  changed_when: false
+
+- name: Remind that admin.conf must be retrieved manually
+  ansible.builtin.debug:
+    msg: >-
+      Control plane and CNI are up. Copy /etc/kubernetes/admin.conf off this node
+      yourself (e.g. scp) to use kubectl from your workstation — this playbook
+      does not copy cluster-admin credentials off-box automatically.
