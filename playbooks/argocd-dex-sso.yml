@@ -1,0 +1,91 @@
+# Wires ArgoCD's login page to Dex SSO by patching the argocd-cm and
+# argocd-secret objects (installed automatically by the k8s_control_plane
+# role's argocd.yml task) in the argocd namespace.
+#
+# Run this on demand, after Dex is up via GitOps (homelab-infra apps/dex) and
+# the shared client secret is generated/sealed on both sides — it is NOT part
+# of main.yml's automatic bootstrap chain, since Dex itself is only deployed
+# once GitOps takes over (applying homelab-infra's root-app.yaml), which
+# happens after this playbook, not before it. The client-secret var lives in
+# inventory/vault/argocd_dex.yml (ansible-vault encrypted, see that file for
+# one-time setup) and must be passed explicitly:
+#
+#   ansible-playbook -i inventory/hosts.yml \
+#     -e @inventory/vault/argocd_dex.yml \
+#     --vault-password-file .vault_pass.txt \
+#     playbooks/argocd-dex-sso.yml
+#
+- name: Wire ArgoCD login to Dex SSO
+  hosts: control_plane
+
+  tasks:
+    - name: Assert the Dex OIDC client secret has been provided
+      ansible.builtin.assert:
+        that:
+          - argocd_dex_client_secret is defined
+          - argocd_dex_client_secret != "PLACEHOLDER_REPLACE_ME"
+          - argocd_dex_client_secret | length > 0
+        fail_msg: >-
+          argocd_dex_client_secret is unset or still the placeholder. Generate
+          one (openssl rand -hex 32), encrypt it into
+          inventory/vault/argocd_dex.yml with ansible-vault, and seal the SAME
+          value into homelab-infra's
+          apps/dex-config/manifests/oidc-client-secrets-sealedsecret.yaml
+          under ARGOCD_CLIENT_SECRET — see that file's header for the
+          kubeseal command.
+
+    - name: Install the Python Kubernetes client (required by kubernetes.core.k8s)
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: python3-kubernetes
+        state: present
+
+    - name: Patch argocd-cm with the Dex external-OIDC provider config
+      become: true
+      become_method: ansible.builtin.sudo
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: patched
+        merge_type: merge
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: argocd-cm
+            namespace: "{{ argocd_namespace }}"
+          data:
+            oidc.config: |
+              name: Dex
+              issuer: {{ argocd_dex_issuer_url }}
+              clientID: {{ argocd_dex_client_id }}
+              clientSecret: $oidc.dex.clientSecret
+              requestedScopes: {{ argocd_dex_requested_scopes | to_json }}
+
+    - name: Patch argocd-secret with the Dex OIDC client secret
+      become: true
+      become_method: ansible.builtin.sudo
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: patched
+        merge_type: merge
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: argocd-secret
+            namespace: "{{ argocd_namespace }}"
+          stringData:
+            oidc.dex.clientSecret: "{{ argocd_dex_client_secret }}"
+
+    - name: Remind that argocd-cm's base url and RBAC group mapping are not set here
+      ansible.builtin.debug:
+        msg: >-
+          argocd-cm's oidc.config and argocd-secret's client secret are
+          patched. This task does NOT set argocd-cm's own `url` key (must
+          already equal {{ argocd_external_url }} to match the redirect URI
+          registered in Dex's staticClients — see homelab-infra's
+          apps/dex/values.yaml) or argocd-rbac-cm's group-to-role mapping
+          (Dex's homelab-infra config uses the `kube-admins` group for this).
+          Patch/verify those separately if SSO login isn't authorizing as
+          expected.

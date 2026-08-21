@@ -1,0 +1,68 @@
+---
+# ArgoCD is bootstrapped imperatively here, same as kube-vip and Cilium — it
+# manages everything else in the cluster via GitOps (homelab-infra) but can't
+# manage its own initial install. Applying root-app.yaml below hands control
+# of everything else in the cluster to ArgoCD/GitOps. Dex SSO wiring is the
+# one deliberate follow-up step NOT done here — see playbooks/argocd-dex-sso.yml.
+
+- name: Check if the argocd namespace already exists
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get namespace argocd
+  register: k8s_control_plane_argocd_ns_check
+  failed_when: false
+  changed_when: false
+
+- name: Create the argocd namespace
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf create namespace argocd
+  when: k8s_control_plane_argocd_ns_check.rc != 0
+  changed_when: true
+
+- name: Install ArgoCD (non-HA manifest)
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    apply -n argocd
+    -f https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml
+  register: k8s_control_plane_argocd_apply
+  changed_when: "'unchanged' not in k8s_control_plane_argocd_apply.stdout"
+
+- name: Wait for the argocd-server deployment to be available
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    -n argocd rollout status deployment/argocd-server --timeout=300s
+  register: k8s_control_plane_argocd_rollout
+  changed_when: false
+
+# The Application CRD is applied as part of install.yaml above but can take a
+# few seconds to become Established — retry rather than race it.
+- name: Apply homelab-infra's root-app.yaml (hands the cluster to GitOps)
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    apply -n argocd
+    -f {{ homelab_infra_root_app_url }}
+  register: k8s_control_plane_root_app_apply
+  until: k8s_control_plane_root_app_apply.rc == 0
+  retries: 12
+  delay: 5
+  changed_when: "'unchanged' not in k8s_control_plane_root_app_apply.stdout"
+
+- name: Remind about the initial admin password and next steps
+  ansible.builtin.debug:
+    msg: >-
+      ArgoCD {{ argocd_version }} is installed in the argocd namespace and
+      root-app.yaml is applied — ArgoCD will now sync everything under
+      homelab-infra's apps/ (Cilium/kube-vip/ArgoCD itself excepted, those
+      stay imperative). Initial admin password:
+      kubectl --kubeconfig=/etc/kubernetes/admin.conf -n argocd get secret
+      argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d.
+      One thing is NOT done here, on purpose: Dex SSO login — run
+      playbooks/argocd-dex-sso.yml once Dex is up via GitOps and the shared
+      client secret is generated/sealed.

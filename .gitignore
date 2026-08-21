@@ -6,3 +6,6 @@
 
 # Ansible retry files
 *.retry
+
+# Ansible Vault password file (never commit — see inventory/vault/argocd_dex.yml)
+.vault_pass.txt
