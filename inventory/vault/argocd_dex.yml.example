@@ -1,0 +1,28 @@
+---
+# Template only — inventory/vault/argocd_dex.yml itself is gitignored so a
+# real secret can never be committed unencrypted, even accidentally.
+#
+# Deliberately NOT under inventory/group_vars/ or inventory/host_vars/: those
+# auto-load for every play against the matching group/host, which would force
+# main.yml (and anything else touching control_plane) to need the vault
+# password too. This file is instead passed explicitly, only to the one
+# playbook that needs it — see playbooks/argocd-dex-sso.yml's header.
+#
+# One-time setup:
+#   1. Copy this template to the real (gitignored) path:
+#        cp inventory/vault/argocd_dex.yml.example inventory/vault/argocd_dex.yml
+#   2. Generate the shared Dex <-> ArgoCD client secret:
+#        openssl rand -hex 32
+#   3. Replace PLACEHOLDER_REPLACE_ME in the copy with the generated value.
+#   4. Choose a vault password and save it locally (never committed), e.g.:
+#        echo -n 'your-chosen-password' > .vault_pass.txt
+#   5. Encrypt the copy in place:
+#        ansible-vault encrypt inventory/vault/argocd_dex.yml \
+#          --vault-password-file .vault_pass.txt
+#
+# The SAME generated value must also be sealed into homelab-infra's
+# apps/dex-config/manifests/oidc-client-secrets-sealedsecret.yaml under the
+# ARGOCD_CLIENT_SECRET key (see that file's header comment for the exact
+# kubeseal command). Until both sides hold the same value, Dex login for
+# ArgoCD will fail with an OIDC client authentication error.
+argocd_dex_client_secret: "PLACEHOLDER_REPLACE_ME"

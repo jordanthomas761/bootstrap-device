@@ -1,9 +1,0 @@
----
-k8s_vip: "192.168.30.120"
-k8s_control_plane_endpoint_port: 6443
-k8s_pod_network_cidr: "10.244.0.0/16"
-kube_vip_version: "v0.8.9"
-# Check https://github.com/cilium/cilium-cli/releases and
-# https://github.com/cilium/cilium/releases for newer tags before bumping.
-cilium_cli_version: "v0.16.22"
-cilium_version: "1.16.5"

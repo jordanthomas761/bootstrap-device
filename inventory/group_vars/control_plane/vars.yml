@@ -1,0 +1,29 @@
+---
+k8s_vip: "192.168.30.120"
+k8s_control_plane_endpoint_port: 6443
+k8s_pod_network_cidr: "10.244.0.0/16"
+kube_vip_version: "v0.8.9"
+# Check https://github.com/cilium/cilium-cli/releases and
+# https://github.com/cilium/cilium/releases for newer tags before bumping.
+cilium_cli_version: "v0.16.22"
+cilium_version: "1.16.5"
+
+# Check https://github.com/argoproj/argo-cd/releases for newer tags before bumping.
+argocd_version: "v3.5.1"
+
+# App-of-apps entry point that hands the rest of the cluster to GitOps —
+# see https://github.com/jordanthomas761/homelab-infra's root-app.yaml.
+homelab_infra_root_app_url: "https://raw.githubusercontent.com/jordanthomas761/homelab-infra/main/root-app.yaml"
+
+# ArgoCD / Dex SSO (see playbooks/argocd-dex-sso.yml).
+# Must match the redirect URI and issuer registered in homelab-infra's
+# apps/dex/values.yaml staticClients entry for the "argocd" client.
+argocd_namespace: argocd
+argocd_external_url: "https://argocd.jordanthomas.site"
+argocd_dex_issuer_url: "https://dex.jordanthomas.site"
+argocd_dex_client_id: "argocd"
+argocd_dex_requested_scopes:
+  - openid
+  - profile
+  - email
+  - groups

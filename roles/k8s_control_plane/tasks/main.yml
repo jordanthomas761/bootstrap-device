@@ -7,3 +7,6 @@
 
 - name: Install the Cilium CNI
   ansible.builtin.import_tasks: cni.yml
+
+- name: Install ArgoCD
+  ansible.builtin.import_tasks: argocd.yml

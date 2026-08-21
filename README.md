@@ -4,11 +4,11 @@ An Ansible automation project for bootstrapping a small kubeadm Kubernetes clust
 
 ## Overview
 
-This project bootstraps a kubeadm-based Kubernetes cluster across a control-plane VM and Raspberry Pi worker nodes (containerd, kube-vip, Cilium), and layers on general device configuration: remote desktop access, development tools, and shell customization.
+This project bootstraps a kubeadm-based Kubernetes cluster across a control-plane VM and Raspberry Pi worker nodes (containerd, kube-vip, Cilium, ArgoCD), and layers on general device configuration: remote desktop access, development tools, and shell customization.
 
 ## Features
 
-- **Kubernetes cluster bootstrap**: kubeadm-based control plane (kube-vip for a stable VIP endpoint, Cilium as the CNI) and worker nodes, via the `k8s_common`/`k8s_control_plane`/`k8s_worker` roles
+- **Kubernetes cluster bootstrap**: kubeadm-based control plane (kube-vip for a stable VIP endpoint, Cilium as the CNI, ArgoCD as the GitOps controller for everything else) and worker nodes, via the `k8s_common`/`k8s_control_plane`/`k8s_worker` roles
 - **Custom MOTD**: Distinct message-of-the-day for Raspberry Pi workers and the control-plane VM
 - **xRDP Remote Desktop**: Remote desktop access with SSL certificate configuration (workers)
 - **Development Tools**: Git and other essential development packages
@@ -42,6 +42,58 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
    ansible-playbook -i inventory/hosts.yml main.yml
    ```
 
+## ArgoCD
+
+`main.yml` installs ArgoCD automatically (`roles/k8s_control_plane/tasks/argocd.yml`,
+right after Cilium) via the official non-HA install manifest, pinned to
+`argocd_version` in `inventory/group_vars/control_plane/vars.yml`. This is
+imperative, like kube-vip and Cilium — ArgoCD can't manage its own initial
+install. Immediately after, the same task applies `homelab-infra`'s
+`root-app.yaml` (fetched from `homelab_infra_root_app_url`, its `main`
+branch), which is the app-of-apps entry point — from that point on, ArgoCD
+syncs and self-heals everything under `homelab-infra`'s `apps/` on its own
+(Cilium, kube-vip, and ArgoCD itself stay imperative, since none of them can
+manage their own bootstrap).
+
+**Dex SSO login is the one deliberate exception, not automated**: once Dex is
+up via GitOps, run `playbooks/argocd-dex-sso.yml` to patch
+`argocd-cm`/`argocd-secret` in the `argocd` namespace and wire the ArgoCD
+login page to Dex as an external OIDC provider. It's not part of `main.yml`'s
+automatic chain since Dex itself doesn't exist until `root-app.yaml` has
+synced, and the shared client secret still needs generating/sealing on both
+sides first (see below).
+
+### Ansible Vault
+
+The Dex OIDC client secret is meant to live ansible-vault-encrypted in
+`inventory/vault/argocd_dex.yml` — that path is gitignored (only
+`inventory/vault/argocd_dex.yml.example`, a template with no real secret, is
+tracked), so a real secret can never land in git unencrypted even by
+accident. It's also kept out of `group_vars`/`host_vars` on purpose, so
+unrelated playbook runs never need the vault password. One-time setup:
+
+```bash
+cp inventory/vault/argocd_dex.yml.example inventory/vault/argocd_dex.yml
+openssl rand -hex 32                    # generate the shared secret, paste it into the copy above
+echo -n 'your-chosen-password' > .vault_pass.txt
+ansible-vault encrypt inventory/vault/argocd_dex.yml --vault-password-file .vault_pass.txt
+```
+
+Then run the SSO playbook:
+
+```bash
+ansible-playbook -i inventory/hosts.yml \
+  -e @inventory/vault/argocd_dex.yml \
+  --vault-password-file .vault_pass.txt \
+  playbooks/argocd-dex-sso.yml
+```
+
+**Coordination with `homelab-infra`**: the same generated secret value must
+also be sealed into that repo's
+`apps/dex-config/manifests/oidc-client-secrets-sealedsecret.yaml` under
+`ARGOCD_CLIENT_SECRET` — Dex and ArgoCD must agree on the client secret for
+SSO to work. Generate it once here, then seal it there.
+
 ## What Gets Configured
 
 ### System Setup
@@ -59,6 +111,9 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 
 - **Ansible Collections**:
   - `community.general` (>= 7.0.0)
+  - `kubernetes.core` (>= 3.0.0) — used by `playbooks/argocd-dex-sso.yml`;
+    also requires the `python3-kubernetes` apt package on the control-plane
+    host (installed automatically by that playbook)
 
 ## Project Structure
 
@@ -69,10 +124,11 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 ├── inventory/
 │   ├── hosts.yml                 # control_plane / workers / ml groups
 │   ├── group_vars/               # cluster-wide + per-group version pins, VIP, CIDR
-│   └── host_vars/                # per-worker vars (e.g. ML workload labeling)
+│   ├── host_vars/                # per-worker vars (e.g. ML workload labeling)
+│   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded, gitignored — only *.yml.example is tracked)
 ├── roles/
 │   ├── k8s_common/                # swap, kernel modules, containerd, kubeadm/kubelet/kubectl
-│   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI
+│   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI, ArgoCD install
 │   └── k8s_worker/                # kubeadm join
 ├── files/
 │   └── 45-allow-colord.pkla     # Polkit policy for Colord
@@ -80,7 +136,8 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
     ├── raspberry-pi-motd.yml     # Worker MOTD
     ├── control-plane-motd.yml    # Control-plane MOTD
     ├── oh-my-zsh.yml            # ZSH shell setup
-    └── machine-learning.yml      # ML tools and libraries
+    ├── machine-learning.yml      # ML tools and libraries
+    └── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
 ```
 
 ## License
