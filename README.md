@@ -8,20 +8,20 @@ This project automates the setup of Raspberry Pi systems with a consistent confi
 
 ## Features
 
-- **Custom MOTD**: Personalized message-of-the-day for Raspberry Pi
-- **xRDP Remote Desktop**: Remote desktop access with SSL certificate configuration
+- **Custom MOTD**: Distinct message-of-the-day for Raspberry Pi workers and the control-plane VM
+- **xRDP Remote Desktop**: Remote desktop access with SSL certificate configuration (workers)
 - **Development Tools**: Git and other essential development packages
-- **Snapd**: Snap package manager with proper PATH configuration
-- **Oh-My-ZSH**: Popular ZSH shell framework for enhanced terminal experience
-- **MicroK8s**: Lightweight Kubernetes distribution for container orchestration
-- **Machine Learning**: Additional ML-related tooling and setup
+- **Oh-My-ZSH**: Popular ZSH shell framework for enhanced terminal experience (control plane + workers)
+- **Machine Learning**: Additional ML-related tooling and setup for designated worker(s)
+
+Kubernetes bootstrap (kubeadm, containerd, kube-vip) is being layered in as roles — see project notes for current status.
 
 ## Prerequisites
 
-- One or more Raspberry Pi devices running a Debian-based OS
+- One Ubuntu Server 24.04 control-plane VM and one or more Raspberry Pi 5 workers running Raspberry Pi OS (64-bit)
 - Ansible installed on your control machine
-- SSH access to your Raspberry Pi devices
-- Ansible inventory file with hosts in the `pis` group
+- SSH access to all devices
+- An inventory defining `control_plane` and `workers` groups (see `inventory/hosts.yml`)
 
 ## Installation
 
@@ -36,27 +36,25 @@ This project automates the setup of Raspberry Pi systems with a consistent confi
    ansible-galaxy collection install -r requirements.yml
    ```
 
-3. Configure your inventory file with your Raspberry Pi hosts in the `pis` group
+3. Edit `inventory/hosts.yml` with your real hostnames/IPs for the `control_plane` and `workers` groups (and `ml` for any worker running ML workloads)
 
 4. Run the playbook:
    ```bash
-   ansible-playbook -i inventory main.yml
+   ansible-playbook -i inventory/hosts.yml main.yml
    ```
 
 ## What Gets Configured
 
 ### System Setup
 - Git version control system
-- Snapd package manager with PATH configuration
-- Colord user permissions for graphical applications
+- Colord user permissions for graphical applications (workers)
 
 ### Remote Access
-- xRDP server for remote desktop connections
-- User added to ssl-cert group for certificate access
+- xRDP server for remote desktop connections (workers)
+- User added to ssl-cert group for certificate access (workers)
 
 ### Development Environment
-- Oh-My-ZSH shell framework
-- MicroK8s Kubernetes cluster
+- Oh-My-ZSH shell framework (control plane + workers)
 
 ## Dependencies
 
@@ -67,15 +65,17 @@ This project automates the setup of Raspberry Pi systems with a consistent confi
 
 ```
 .
-├── main.yml                    # Main playbook orchestrating all configurations
-├── requirements.yml            # Ansible collection dependencies
+├── main.yml                      # Main playbook orchestrating all configurations
+├── requirements.yml              # Ansible collection dependencies
+├── inventory/
+│   └── hosts.yml                 # control_plane / workers / ml groups
 ├── files/
-│   └── 45-allow-colord.pkla   # Polkit policy for Colord
+│   └── 45-allow-colord.pkla     # Polkit policy for Colord
 └── playbooks/
-    ├── raspberry-pi-motd.yml   # Custom MOTD configuration
-    ├── oh-my-zsh.yml          # ZSH shell setup
-    ├── microk8s.yml           # Kubernetes setup
-    └── machine-learning.yml    # ML tools and libraries
+    ├── raspberry-pi-motd.yml     # Worker MOTD
+    ├── control-plane-motd.yml    # Control-plane MOTD
+    ├── oh-my-zsh.yml            # ZSH shell setup
+    └── machine-learning.yml      # ML tools and libraries
 ```
 
 ## License

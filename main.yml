@@ -3,8 +3,26 @@
 - name: Include Raspberry-Pi MOTD.
   ansible.builtin.import_playbook: playbooks/raspberry-pi-motd.yml
 
+- name: Include Control-Plane MOTD.
+  ansible.builtin.import_playbook: playbooks/control-plane-motd.yml
+
+- name: Bootstrap Kubernetes prerequisites
+  hosts: control_plane:workers
+  roles:
+    - k8s_common
+
+- name: Bootstrap Kubernetes control plane
+  hosts: control_plane
+  roles:
+    - k8s_control_plane
+
+- name: Bootstrap Kubernetes workers
+  hosts: workers
+  roles:
+    - k8s_worker
+
 - name: Initial machine setup
-  hosts: pis
+  hosts: workers
 
   tasks:
     - name: Setup Git
@@ -36,32 +54,9 @@
             src: "{{ source_path }}"
             dest: /etc/polkit-1/localauthority/50-local.d/
             mode: "0644"
-    - name: Ensure Snapd installed.
-      become: true
-      ansible.builtin.apt:
-        name: snapd
-    - name: Check env file groups
-      ansible.builtin.shell: grep -c ':/snap/bin' /etc/environment || true
-      changed_when: false
-      register: env_snap
-    - name: Append snap
-      become: true
-      become_method: ansible.builtin.sudo
-      ansible.builtin.lineinfile:
-        path: /etc/environment
-        regexp: "^(PATH=\".*)(\")$"
-        line: '\1:/snap/bin\2'
-        backrefs: true
-      when: env_snap.stdout == "0"
 
 - name: Include Oh-My-ZSH.
   ansible.builtin.import_playbook: playbooks/oh-my-zsh.yml
 
-- name: Include Docker.
-  ansible.builtin.import_playbook: playbooks/docker.yml
-
-- name: Include MicroK8s.
-  ansible.builtin.import_playbook: playbooks/microk8s.yml
-
-- name: Include OpenVPN.
-  ansible.builtin.import_playbook: playbooks/openvpn.yml
+- name: Include Machine Learning.
+  ansible.builtin.import_playbook: playbooks/machine-learning.yml
