@@ -27,3 +27,8 @@ argocd_dex_requested_scopes:
   - profile
   - email
   - groups
+
+# Group Dex's LDAP connector maps admins into (see homelab-infra's
+# apps/dex/values.yaml groupSearch config) — mapped to ArgoCD's built-in
+# admin role below.
+argocd_dex_admin_group: kube-admins
