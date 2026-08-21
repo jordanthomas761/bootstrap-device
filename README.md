@@ -37,7 +37,14 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 
 3. Edit `inventory/hosts.yml` with your real hostnames/IPs for the `control_plane` and `workers` groups (and `ml` for any worker running ML workloads)
 
-4. Run the playbook:
+4. (Optional, one-time) If your SSH user needs a password for `sudo`, every
+   `become: true` task below will fail with `Missing sudo password` unless
+   you either pass `-K` on every run or grant passwordless sudo once:
+   ```bash
+   ansible-playbook -i inventory/hosts.yml playbooks/passwordless-sudo.yml -K
+   ```
+
+5. Run the playbook:
    ```bash
    ansible-playbook -i inventory/hosts.yml main.yml
    ```
@@ -133,6 +140,7 @@ SSO to work. Generate it once here, then seal it there.
 ├── files/
 │   └── 45-allow-colord.pkla     # Polkit policy for Colord
 └── playbooks/
+    ├── passwordless-sudo.yml      # One-time: grants NOPASSWD sudo so -K isn't needed on later runs
     ├── raspberry-pi-motd.yml     # Worker MOTD
     ├── control-plane-motd.yml    # Control-plane MOTD
     ├── oh-my-zsh.yml            # ZSH shell setup
