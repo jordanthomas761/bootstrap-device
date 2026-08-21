@@ -65,13 +65,16 @@ sides first (see below).
 
 ### Ansible Vault
 
-The Dex OIDC client secret is stored encrypted in `inventory/vault/argocd_dex.yml`
-(kept out of `group_vars`/`host_vars` on purpose, so unrelated playbook runs
-never need the vault password — see that file's header for setup). One-time
-setup:
+The Dex OIDC client secret is meant to live ansible-vault-encrypted in
+`inventory/vault/argocd_dex.yml` — that path is gitignored (only
+`inventory/vault/argocd_dex.yml.example`, a template with no real secret, is
+tracked), so a real secret can never land in git unencrypted even by
+accident. It's also kept out of `group_vars`/`host_vars` on purpose, so
+unrelated playbook runs never need the vault password. One-time setup:
 
 ```bash
-openssl rand -hex 32                    # generate the shared secret
+cp inventory/vault/argocd_dex.yml.example inventory/vault/argocd_dex.yml
+openssl rand -hex 32                    # generate the shared secret, paste it into the copy above
 echo -n 'your-chosen-password' > .vault_pass.txt
 ansible-vault encrypt inventory/vault/argocd_dex.yml --vault-password-file .vault_pass.txt
 ```
@@ -122,7 +125,7 @@ SSO to work. Generate it once here, then seal it there.
 │   ├── hosts.yml                 # control_plane / workers / ml groups
 │   ├── group_vars/               # cluster-wide + per-group version pins, VIP, CIDR
 │   ├── host_vars/                # per-worker vars (e.g. ML workload labeling)
-│   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded)
+│   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded, gitignored — only *.yml.example is tracked)
 ├── roles/
 │   ├── k8s_common/                # swap, kernel modules, containerd, kubeadm/kubelet/kubectl
 │   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI, ArgoCD install

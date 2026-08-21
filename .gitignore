@@ -7,5 +7,11 @@
 # Ansible retry files
 *.retry
 
-# Ansible Vault password file (never commit — see inventory/vault/argocd_dex.yml)
+# Ansible Vault password file (never commit — see inventory/vault/argocd_dex.yml.example)
 .vault_pass.txt
+
+# Real vault-secrets files — only the .yml.example templates are tracked, so
+# a real secret can never land in git unencrypted even by accident. Encrypted
+# vault files are safe to force-add (git add -f) once ansible-vault encrypt
+# has actually been run on them.
+inventory/vault/*.yml

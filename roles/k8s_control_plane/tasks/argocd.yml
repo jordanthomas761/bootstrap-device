@@ -10,7 +10,9 @@
   become_method: ansible.builtin.sudo
   ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get namespace argocd
   register: k8s_control_plane_argocd_ns_check
-  failed_when: false
+  failed_when: >-
+    k8s_control_plane_argocd_ns_check.rc != 0 and
+    'NotFound' not in k8s_control_plane_argocd_ns_check.stderr
   changed_when: false
 
 - name: Create the argocd namespace
@@ -28,7 +30,7 @@
     apply -n argocd
     -f https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml
   register: k8s_control_plane_argocd_apply
-  changed_when: "'unchanged' not in k8s_control_plane_argocd_apply.stdout"
+  changed_when: k8s_control_plane_argocd_apply.stdout is search('created|configured')
 
 - name: Wait for the argocd-server deployment to be available
   become: true
@@ -52,7 +54,7 @@
   until: k8s_control_plane_root_app_apply.rc == 0
   retries: 12
   delay: 5
-  changed_when: "'unchanged' not in k8s_control_plane_root_app_apply.stdout"
+  changed_when: k8s_control_plane_root_app_apply.stdout is search('created|configured')
 
 - name: Remind about the initial admin password and next steps
   ansible.builtin.debug:

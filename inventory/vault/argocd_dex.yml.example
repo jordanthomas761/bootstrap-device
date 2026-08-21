@@ -1,5 +1,6 @@
 ---
-# NEEDS ENCRYPTION — this file must never be committed unencrypted.
+# Template only — inventory/vault/argocd_dex.yml itself is gitignored so a
+# real secret can never be committed unencrypted, even accidentally.
 #
 # Deliberately NOT under inventory/group_vars/ or inventory/host_vars/: those
 # auto-load for every play against the matching group/host, which would force
@@ -8,12 +9,14 @@
 # playbook that needs it — see playbooks/argocd-dex-sso.yml's header.
 #
 # One-time setup:
-#   1. Generate the shared Dex <-> ArgoCD client secret:
+#   1. Copy this template to the real (gitignored) path:
+#        cp inventory/vault/argocd_dex.yml.example inventory/vault/argocd_dex.yml
+#   2. Generate the shared Dex <-> ArgoCD client secret:
 #        openssl rand -hex 32
-#   2. Replace PLACEHOLDER_REPLACE_ME below with the generated value.
-#   3. Choose a vault password and save it locally (never committed), e.g.:
+#   3. Replace PLACEHOLDER_REPLACE_ME in the copy with the generated value.
+#   4. Choose a vault password and save it locally (never committed), e.g.:
 #        echo -n 'your-chosen-password' > .vault_pass.txt
-#   4. Encrypt this file in place:
+#   5. Encrypt the copy in place:
 #        ansible-vault encrypt inventory/vault/argocd_dex.yml \
 #          --vault-password-file .vault_pass.txt
 #
