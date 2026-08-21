@@ -1,6 +1,9 @@
-# Wires ArgoCD's login page to Dex SSO by patching the argocd-cm and
-# argocd-secret objects (installed automatically by the k8s_control_plane
-# role's argocd.yml task) in the argocd namespace.
+# Wires ArgoCD's login page to Dex SSO by patching argocd-cm, argocd-secret,
+# and argocd-rbac-cm (installed automatically by the k8s_control_plane role's
+# argocd.yml task) in the argocd namespace. ArgoCD's own config is
+# deliberately kept out of GitOps (see homelab-infra's
+# apps/argocd-httproute/manifests/namespace-argocd-label.yaml) since it can't
+# fully self-manage its own bootstrap resources — patched here instead.
 #
 # Run this on demand, after Dex is up via GitOps (homelab-infra apps/dex) and
 # the shared client secret is generated/sealed on both sides — it is NOT part
@@ -82,14 +85,41 @@
           stringData:
             oidc.dex.clientSecret: "{{ argocd_dex_client_secret }}"
 
-    - name: Remind that argocd-cm's base url and RBAC group mapping are not set here
-      ansible.builtin.debug:
-        msg: >-
-          argocd-cm's oidc.config and argocd-secret's client secret are
-          patched. This task does NOT set argocd-cm's own `url` key (must
-          already equal {{ argocd_external_url }} to match the redirect URI
-          registered in Dex's staticClients — see homelab-infra's
-          apps/dex/values.yaml) or argocd-rbac-cm's group-to-role mapping
-          (Dex's homelab-infra config uses the `kube-admins` group for this).
-          Patch/verify those separately if SSO login isn't authorizing as
-          expected.
+    - name: Patch argocd-cm with ArgoCD's own external URL
+      become: true
+      become_method: ansible.builtin.sudo
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: patched
+        merge_type: merge
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: argocd-cm
+            namespace: "{{ argocd_namespace }}"
+          data:
+            url: "{{ argocd_external_url }}"
+
+    # This playbook owns and fully overwrites the policy.csv/policy.default
+    # keys (not additive) — the merge patch only replaces these two keys, so
+    # other argocd-rbac-cm data keys are left alone, but any RBAC rule beyond
+    # the Dex admin group mapping must be added here, not applied out-of-band,
+    # or it'll get clobbered the next time this playbook runs.
+    - name: Patch argocd-rbac-cm with the Dex admin group mapping
+      become: true
+      become_method: ansible.builtin.sudo
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        state: patched
+        merge_type: merge
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: argocd-rbac-cm
+            namespace: "{{ argocd_namespace }}"
+          data:
+            policy.csv: |
+              g, {{ argocd_dex_admin_group }}, role:admin
+            policy.default: role:readonly
