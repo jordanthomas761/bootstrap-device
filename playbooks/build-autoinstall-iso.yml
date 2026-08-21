@@ -1,0 +1,85 @@
+---
+# Builds a cloud-init NoCloud seed ISO so the Ubuntu Server 24.04 installer
+# runs unattended inside the UTM VM — no manual TUI steps. Run locally
+# (this targets the Mac you're running Ansible from, not the VM):
+#
+#   ansible-playbook playbooks/build-autoinstall-iso.yml
+#
+# Then attach the resulting ISO as a second CD-ROM drive on the VM in UTM
+# and boot it.
+- name: Build Ubuntu autoinstall seed ISO
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    control_plane_hostname: control-plane
+    control_plane_username: "{{ lookup('env', 'USER') }}"
+    ssh_pubkey_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    build_dir: "{{ playbook_dir }}/../build/autoinstall-seed"
+    output_iso: "{{ playbook_dir }}/../build/autoinstall-seed.iso"
+
+  vars_prompt:
+    - name: control_plane_password
+      prompt: "Local account password for the VM (SSH password auth is disabled either way)"
+      private: true
+      confirm: true
+
+  tasks:
+    - name: Verify SSH public key file exists
+      ansible.builtin.stat:
+        path: "{{ ssh_pubkey_path }}"
+      register: k8s_autoinstall_ssh_pubkey_stat
+
+    - name: Fail if SSH public key is missing
+      ansible.builtin.fail:
+        msg: >-
+          No SSH public key found at {{ ssh_pubkey_path }}.
+          Pass -e ssh_pubkey_path=/path/to/key.pub to point at a different one.
+      when: not k8s_autoinstall_ssh_pubkey_stat.stat.exists
+
+    - name: Ensure build directory exists
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Hash the local account password
+      ansible.builtin.command:
+        cmd: openssl passwd -6 -stdin
+        stdin: "{{ control_plane_password }}"
+      register: control_plane_password_hash
+      changed_when: false
+      no_log: true
+
+    - name: Render autoinstall user-data
+      ansible.builtin.template:
+        src: user-data.j2
+        dest: "{{ build_dir }}/user-data"
+        mode: "0600"
+
+    - name: Render autoinstall meta-data
+      ansible.builtin.template:
+        src: meta-data.j2
+        dest: "{{ build_dir }}/meta-data"
+        mode: "0600"
+
+    - name: Remove any previous seed ISO
+      ansible.builtin.file:
+        path: "{{ output_iso }}"
+        state: absent
+
+    - name: Build the NoCloud seed ISO
+      ansible.builtin.command:
+        cmd: >-
+          hdiutil makehybrid -iso -joliet
+          -default-volume-name cidata
+          -o {{ output_iso }}
+          {{ build_dir }}
+      changed_when: true
+
+    - name: Report output path
+      ansible.builtin.debug:
+        msg: >-
+          Seed ISO ready at {{ output_iso }} — attach it as a second CD-ROM
+          drive on the control-plane VM in UTM, then boot.

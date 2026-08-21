@@ -1,0 +1,29 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  network:
+    version: 2
+    ethernets:
+      # matched by pattern rather than a fixed name — virtio-net interface
+      # names aren't guaranteed stable across QEMU machine-type versions
+      any-nic:
+        match:
+          name: "en*"
+        dhcp4: true
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - "{{ lookup('file', ssh_pubkey_path) }}"
+  identity:
+    hostname: "{{ control_plane_hostname }}"
+    username: "{{ control_plane_username }}"
+    password: "{{ control_plane_password_hash.stdout }}"
+  storage:
+    layout:
+      name: direct
+  updates: security
+  shutdown: reboot

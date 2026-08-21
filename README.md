@@ -42,6 +42,16 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
    ansible-playbook -i inventory/hosts.yml main.yml
    ```
 
+## Unattended VM Install (Control Plane)
+
+For a UTM/QEMU control-plane VM, `playbooks/build-autoinstall-iso.yml` generates an Ubuntu Server 24.04 `autoinstall` seed ISO so the OS install itself requires no manual TUI steps:
+
+```bash
+ansible-playbook playbooks/build-autoinstall-iso.yml
+```
+
+Attach the resulting `build/autoinstall-seed.iso` as a second CD-ROM drive on the VM (alongside the Ubuntu installer ISO) and boot — hostname, disk layout, OpenSSH, and your SSH public key are all pre-seeded. Override defaults with `-e control_plane_username=... -e ssh_pubkey_path=...`.
+
 ## ArgoCD
 
 `main.yml` installs ArgoCD automatically (`roles/k8s_control_plane/tasks/argocd.yml`,
@@ -137,7 +147,9 @@ SSO to work. Generate it once here, then seal it there.
     ├── control-plane-motd.yml    # Control-plane MOTD
     ├── oh-my-zsh.yml            # ZSH shell setup
     ├── machine-learning.yml      # ML tools and libraries
-    └── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
+    ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
+    ├── build-autoinstall-iso.yml # Ubuntu autoinstall seed ISO for the control-plane VM
+    └── templates/                # user-data / meta-data templates for the above
 ```
 
 ## License
