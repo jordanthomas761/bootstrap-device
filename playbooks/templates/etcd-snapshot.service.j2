@@ -1,0 +1,15 @@
+# Managed by playbooks/etcd-snapshot-backup.yml — do not hand-edit.
+[Unit]
+Description=Take a verified etcd snapshot and ship it off-host
+# Only meaningful once containerd is up: the script reaches etcd through
+# crictl, deliberately not through the apiserver.
+After=containerd.service
+Wants=containerd.service
+
+[Service]
+Type=oneshot
+ExecStart={{ etcd_snapshot_script }}
+# The snapshot briefly holds a read transaction on etcd; being nice keeps it
+# from competing with the apiserver on a small control plane.
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,14 @@
+# Managed by playbooks/etcd-snapshot-backup.yml — do not hand-edit.
+[Unit]
+Description=Periodic verified etcd snapshot
+
+[Timer]
+OnCalendar={{ etcd_snapshot_on_calendar }}
+# Spread the run so every timer on the box does not fire on the same second.
+RandomizedDelaySec=300
+# Catch up after downtime: a control plane that was off overnight should take a
+# snapshot when it comes back, not silently skip until the next boundary.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

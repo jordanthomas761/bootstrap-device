@@ -217,6 +217,83 @@ protect against anyone who can reach the apiserver with cluster-admin — the
 apiserver holds the key and decrypts on read. It is a defence against offline
 access to the data, not against cluster access.
 
+It also does nothing at all for **availability** — see the next section.
+Encryption stops a stolen snapshot being readable; it does not help when the
+control plane is simply gone.
+
+## etcd Snapshots
+
+Encryption and snapshots are the two halves of protecting etcd, and they solve
+opposite problems. Encryption is confidentiality; snapshots are availability.
+On a single-control-plane cluster losing that one VM loses all cluster state,
+and a surviving encryption key does not help if there is nothing left to
+decrypt.
+
+`playbooks/etcd-snapshot-backup.yml` installs a systemd timer that takes a
+verified snapshot and ships it off the host:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/etcd-snapshot-backup.yml
+```
+
+Safe and boring to run, unlike the encryption playbook: it writes a script, a
+service and a timer, and never touches the apiserver manifest. No API outage.
+
+Three design choices worth knowing, because each one is about the backup still
+working when things are broken:
+
+- **It uses `crictl`, not `kubectl`.** `kubectl` needs a healthy apiserver, and
+  the moment you most want a snapshot is the moment the apiserver is broken.
+  `crictl` talks to containerd directly.
+- **It is a systemd timer on the host, not a CronJob in the cluster.** A backup
+  that needs the cluster healthy in order to run is not a backup.
+- **It verifies before keeping.** `etcdctl snapshot status` parses the file and
+  checks its hash, and the script refuses to keep a snapshot reporting zero
+  keys. The difference between having a backup and having a file is whether
+  anything ever checked.
+
+Remote shipping **enables itself only once the SSH key actually works**. If the
+key is not yet installed on the far end, the playbook says so loudly and prints
+the public key to install, rather than writing config that would leave a timer
+looking healthy in `systemctl list-timers` while every run silently failed to
+leave the host.
+
+Snapshots are ~3 MB gzipped, so frequency is cheap. Defaults: every 6 hours,
+3 kept locally as staging, 28 kept remotely (a week).
+
+Note snapshot size tracks etcd's **file** size, not its live data — a snapshot
+copies free pages too. This cluster once sat at 740 MiB `dbSize` against 15 MiB
+of real data, which would have made every snapshot 50x larger than necessary.
+Check with `etcdctl endpoint status --write-out=json` and compare `dbSize`
+against `dbSizeInUse`; if the gap is large, `etcdctl defrag` reclaims it.
+
+### Restoring
+
+Snapshots restore into a *new* data directory — restore never writes over a
+live one. To recover a control plane:
+
+1. Get a snapshot: from `/var/backups/etcd/` if the host survives, otherwise
+   from the remote copy. Decompress it: `gunzip etcd-<ts>.db.gz`.
+2. Stop the apiserver and etcd by moving their manifests out of
+   `/etc/kubernetes/manifests/` — **to somewhere outside that directory**. The
+   kubelet parses every non-hidden file there, so a manifest "moved aside" but
+   left in place still runs.
+3. Restore into a fresh directory:
+   ```bash
+   etcdctl snapshot restore etcd-<ts>.db --data-dir=/var/lib/etcd-restored
+   ```
+4. Move the old data dir aside and put the restored one at `/var/lib/etcd`.
+5. Move the manifests back. The kubelet restarts etcd and the apiserver against
+   the restored data.
+6. If encryption at rest is on, the restored data is still ciphertext — the
+   apiserver needs the same key from `inventory/vault/etcd_encryption.yml` to
+   read it. Restoring onto a rebuilt control plane means running the encryption
+   playbook with that vault file **before** expecting Secrets to be readable.
+
+You can rehearse step 3 without touching anything live: restore a snapshot to a
+scratch `--data-dir` and confirm it produces a `member/` subdirectory. That is
+worth doing occasionally — it is the only check that proves a snapshot is
+genuinely restorable rather than merely well-formed.
 ## Longhorn Host Preparation
 
 Longhorn is deployed by GitOps from `homelab-infra` (`apps/longhorn`), but it
@@ -371,6 +448,7 @@ actually authenticates as.
     ├── machine-learning.yml      # ML tools and libraries
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)
+    ├── etcd-snapshot-backup.yml  # Installs the verified-snapshot systemd timer (safe to run, no API outage)
     ├── build-autoinstall-iso.yml # Ubuntu autoinstall seed ISO for the control-plane VM
     ├── files/                    # kube-apiserver manifest patcher used by the encryption playbook
     └── templates/                # user-data / meta-data / EncryptionConfiguration templates
