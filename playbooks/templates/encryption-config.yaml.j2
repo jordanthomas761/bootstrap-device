@@ -1,0 +1,21 @@
+# Managed by playbooks/etcd-encryption-at-rest.yml — do not hand-edit.
+#
+# Provider order is the whole design here. The FIRST provider is the one the
+# apiserver writes with; every provider is tried, in order, on read. So
+# aescbc-then-identity means new writes are encrypted while anything still
+# sitting in etcd as plaintext stays readable — which is what makes this safe
+# to turn on for a cluster that already has secrets in it.
+#
+# Reversing them (identity first) would silently DECRYPT everything on the next
+# write, and removing identity before every secret has been rewritten would
+# make the not-yet-encrypted ones permanently unreadable.
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources: {{ etcd_encryption_resources | to_json }}
+    providers:
+      - aescbc:
+          keys:
+            - name: {{ etcd_encryption_key_name }}
+              secret: {{ etcd_encryption_key }}
+      - identity: {}
