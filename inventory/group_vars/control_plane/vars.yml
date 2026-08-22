@@ -32,3 +32,18 @@ argocd_dex_requested_scopes:
 # apps/dex/values.yaml groupSearch config) — mapped to ArgoCD's built-in
 # admin role in playbooks/argocd-dex-sso.yml.
 argocd_dex_admin_group: kube-admins
+
+# etcd encryption at rest (see playbooks/etcd-encryption-at-rest.yml).
+# The key itself is NOT here and never goes in git — it is generated on the
+# control plane at etcd_encryption_key_file and stays there.
+etcd_encryption_dir: /etc/kubernetes/enc
+etcd_encryption_key_file: "{{ etcd_encryption_dir }}/key1.b64"
+etcd_encryption_config_file: "{{ etcd_encryption_dir }}/encryption-config.yaml"
+# Bump this (key2, key3, ...) only as part of a deliberate key rotation.
+etcd_encryption_key_name: key1
+# Secrets are the reason to do this at all. ConfigMaps could be added, at the
+# cost of a much larger rewrite step and no real gain here — nothing sensitive
+# is stored in one.
+etcd_encryption_resources:
+  - secrets
+etcd_encryption_canary_name: etcd-encryption-canary
