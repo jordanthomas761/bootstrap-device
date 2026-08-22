@@ -1,0 +1,20 @@
+---
+# Template for inventory/vault/etcd_encryption.yml, which holds the AES-CBC key
+# kube-apiserver uses to encrypt Secrets at rest in etcd. Copy this file, put a
+# real key in it, then ansible-vault encrypt it -- see the README.
+#
+# ONLY generate a new key when standing up encryption on a cluster for the
+# FIRST time:
+#
+#     openssl rand -base64 32
+#
+# If this cluster already has encrypted Secrets, do NOT put a fresh key here.
+# The key is not a credential you can rotate by overwriting: every Secret
+# already in etcd was written under the old one and becomes undecryptable the
+# moment it is gone. Proper rotation adds a second key ahead of the current one
+# in the EncryptionConfiguration, rewrites every Secret, and only then drops the
+# old key. The README covers that sequence.
+#
+# The real file is committed already-encrypted. This template exists so a real
+# key can never land in git in plaintext.
+vault_etcd_encryption_key: "REPLACE-WITH-BASE64-32-BYTE-KEY"

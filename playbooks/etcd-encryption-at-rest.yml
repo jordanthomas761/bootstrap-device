@@ -5,12 +5,18 @@
 # in main.yml's bootstrap chain, because it restarts kube-apiserver and rewrites
 # every Secret in the cluster:
 #
-#   ansible-playbook -i inventory/hosts.yml playbooks/etcd-encryption-at-rest.yml
+#   ansible-playbook -i inventory/hosts.yml \
+#     -e @inventory/vault/etcd_encryption.yml \
+#     --vault-password-file .vault_pass.txt \
+#     playbooks/etcd-encryption-at-rest.yml
 #
-# Safe to re-run. The encryption key is generated exactly once and never
-# rotated by a re-run — regenerating it would make every already-encrypted
-# Secret undecryptable. To rotate deliberately, see the README section this
-# playbook's final message points at.
+# The key comes from that vault file rather than being minted on the control
+# plane, so it survives losing the VM — see inventory/vault/etcd_encryption.yml.
+#
+# Safe to re-run: it installs the same key every time. Do not edit the key to
+# "rotate" it — every already-encrypted Secret would become undecryptable. To
+# rotate deliberately, see the README section this playbook's final message
+# points at.
 #
 # This is a single-control-plane cluster, so the apiserver restart is a brief
 # full API outage (~15-30s). Nothing running in the cluster stops, but kubectl
@@ -84,39 +90,51 @@
         group: root
         mode: "0700"
 
-    # creates: is what makes this generate-once. Without it a re-run would mint
-    # a new key, and every Secret already written under the old one would become
-    # permanently undecryptable.
-    - name: Generate the AES-CBC encryption key, once and only once
-      become: true
-      become_method: ansible.builtin.sudo
-      ansible.builtin.shell: >
-        umask 077 && openssl rand -base64 32 > {{ etcd_encryption_key_file }}
-      args:
-        executable: /bin/bash
-        creates: "{{ etcd_encryption_key_file }}"
+    # The key comes from the vault file, it is NOT minted here. It used to be
+    # generated on the control plane with `openssl rand` and existed nowhere
+    # else, which made that single VM a total-loss point for every Secret in
+    # the cluster. Sourcing it from inventory/vault/etcd_encryption.yml -- the
+    # same pattern as the Dex client secret -- means the off-host copy is a
+    # property of where the key lives rather than a backup job that has to keep
+    # running. It also makes rebuilding a control plane reproducible: the new
+    # one gets the same key and can read everything already in etcd.
+    - name: Require the encryption key to be supplied from the vault
+      ansible.builtin.assert:
+        that:
+          - vault_etcd_encryption_key is defined
+          - vault_etcd_encryption_key | length > 0
+        fail_msg: >-
+          vault_etcd_encryption_key is not set. This playbook needs the vault
+          file, so pass it explicitly:
+            ansible-playbook -i inventory/hosts.yml
+            -e @inventory/vault/etcd_encryption.yml
+            --vault-password-file .vault_pass.txt
+            playbooks/etcd-encryption-at-rest.yml
+          If the vault file is missing entirely, see the README section on
+          etcd encryption at rest before inventing a new key -- a different
+          key makes every Secret already in etcd undecryptable.
+        quiet: true
 
-    - name: Lock down the key file
+    # Trailing newline is deliberate: it reproduces byte-for-byte what
+    # `openssl rand -base64 32 > file` used to write, so adopting an existing
+    # key is a genuine no-op rather than a rewrite that restarts the apiserver.
+    - name: Install the encryption key from the vault
       become: true
       become_method: ansible.builtin.sudo
-      ansible.builtin.file:
-        path: "{{ etcd_encryption_key_file }}"
+      ansible.builtin.copy:
+        content: "{{ vault_etcd_encryption_key }}\n"
+        dest: "{{ etcd_encryption_key_file }}"
         owner: root
         group: root
         mode: "0600"
-
-    - name: Read the encryption key back
-      become: true
-      become_method: ansible.builtin.sudo
-      ansible.builtin.slurp:
-        src: "{{ etcd_encryption_key_file }}"
-      register: etcd_encryption_key_slurp
+      no_log: true
+      notify: Restart kube-apiserver
 
     - name: Write the EncryptionConfiguration
       become: true
       become_method: ansible.builtin.sudo
       vars:
-        etcd_encryption_key: "{{ etcd_encryption_key_slurp.content | b64decode | trim }}"
+        etcd_encryption_key: "{{ vault_etcd_encryption_key }}"
       ansible.builtin.template:
         src: encryption-config.yaml.j2
         dest: "{{ etcd_encryption_config_file }}"
@@ -238,10 +256,12 @@
       ansible.builtin.debug:
         msg: >-
           Secrets are now encrypted at rest in etcd with AES-CBC, verified
-          against a canary. The key lives at {{ etcd_encryption_key_file }} on
-          the control plane, mode 0600, and is NOT in git or in Ansible Vault —
-          back it up somewhere safe, because losing it means losing every
-          Secret in the cluster. Note the identity provider is still in the
+          against a canary. The key was installed from
+          inventory/vault/etcd_encryption.yml to {{ etcd_encryption_key_file }}
+          (mode 0600); that vault file is the source of truth and is already
+          backed up by virtue of being in git, so recovering a lost control
+          plane needs only this repo plus .vault_pass.txt — keep that password
+          out of band. Note the identity provider is still in the
           read chain, which is what lets old plaintext values be read; that is
           correct and should stay. This protects an etcd snapshot or a stolen
           disk. It does NOT protect against anyone who can reach the apiserver
