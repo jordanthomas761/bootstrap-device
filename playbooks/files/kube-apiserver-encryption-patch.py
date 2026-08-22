@@ -30,6 +30,15 @@ except ImportError:
     sys.exit(1)
 
 MANIFEST = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+# Deliberately OUTSIDE /etc/kubernetes/manifests. The kubelet treats every
+# non-hidden file in that directory as a static pod manifest, so a backup kept
+# next to the original is parsed as a SECOND Pod named kube-apiserver -- one
+# still carrying the pre-patch, unencrypted spec. The kubelet then flaps
+# between the two and can settle on the backup, leaving the apiserver running
+# without --encryption-provider-config even though the real manifest is
+# correctly patched. (Observed exactly that: the encrypted pod was created,
+# then torn down and replaced by one with no encryption-config volume.)
+BACKUP = "/etc/kubernetes/kube-apiserver.yaml.pre-encryption"
 FLAG = "--encryption-provider-config"
 VOLUME_NAME = "encryption-config"
 
@@ -110,9 +119,13 @@ def main():
         print("kube-apiserver manifest already references %s" % config_path)
         return 0
 
-    # Keep a copy of whatever was working before this run.
-    shutil.copy2(MANIFEST, MANIFEST + ".pre-encryption")
+    # Keep a copy of whatever was working before this run, outside the
+    # kubelet's static pod directory -- see the BACKUP comment above.
+    shutil.copy2(MANIFEST, BACKUP)
 
+    # The temp file must share a filesystem with MANIFEST for os.replace to be
+    # atomic, so it stays in the manifests directory. Safe because the leading
+    # dot makes the kubelet skip it -- unlike the backup above, which had no dot.
     directory = os.path.dirname(MANIFEST)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".kube-apiserver-", suffix=".tmp")
     try:

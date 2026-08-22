@@ -29,6 +29,16 @@
       ansible.builtin.command: >
         kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system delete pod
         -l component=kube-apiserver --wait=false
+      # Retried, because this races itself. Patching the manifest already makes
+      # the kubelet restart the apiserver, so by the time this handler fires the
+      # API is often mid-restart and kubectl gets "connection refused" -- which
+      # failed the whole play *after* it had changed the manifest, leaving the
+      # rewrite and verification steps below unrun. Retrying rides out the
+      # restart the manifest change itself triggered.
+      register: etcd_encryption_restart
+      until: etcd_encryption_restart.rc == 0
+      retries: 30
+      delay: 5
       changed_when: true
 
   tasks:
@@ -39,7 +49,23 @@
       failed_when: not etcd_encryption_admin_conf.stat.exists
 
     # The manifest patcher below parses the kube-apiserver static pod YAML.
+    #
+    # Checked before installing, rather than letting apt decide it is already
+    # satisfied, because `update_cache: true` refreshes EVERY configured repo
+    # and this host has the pkgs.k8s.io one, which intermittently answers 403
+    # Forbidden from its CDN. That turned a no-op into a hard failure of the
+    # whole playbook on a box that already had python3-yaml. Skipping the apt
+    # task entirely when the import works keeps the CDN out of the path in the
+    # normal case, while still installing it for real when it is genuinely
+    # missing.
+    - name: Check whether PyYAML is already importable
+      ansible.builtin.command: python3 -c "import yaml"
+      register: etcd_encryption_pyyaml
+      changed_when: false
+      failed_when: false
+
     - name: Install PyYAML (required by the kube-apiserver manifest patcher)
+      when: etcd_encryption_pyyaml.rc != 0
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.apt:
