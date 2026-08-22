@@ -1,0 +1,101 @@
+#!/bin/bash
+# Managed by playbooks/etcd-snapshot-backup.yml — do not hand-edit.
+#
+# Takes a verified etcd snapshot and ships it off the control plane.
+#
+# Driven by crictl, NOT kubectl, on purpose. kubectl needs a working apiserver,
+# and the moment you most want a backup is the moment the apiserver is broken.
+# crictl talks to containerd directly, so this keeps working with the control
+# plane in pieces. Same reasoning puts this in a systemd timer on the host
+# rather than a CronJob in the cluster: a backup that needs the cluster healthy
+# in order to run is not a backup.
+set -euo pipefail
+
+STAGE_DIR="{{ etcd_snapshot_stage_dir }}"
+KEEP_LOCAL={{ etcd_snapshot_keep_local }}
+KEEP_REMOTE={{ etcd_snapshot_keep_remote }}
+REMOTE_ENABLED="{{ 'yes' if etcd_snapshot_remote_enabled else 'no' }}"
+REMOTE_USER="{{ etcd_snapshot_remote_user }}"
+REMOTE_HOST="{{ etcd_snapshot_remote_host }}"
+REMOTE_PATH="{{ etcd_snapshot_remote_path }}"
+SSH_KEY="{{ etcd_snapshot_ssh_key }}"
+
+CERTS="--cacert=/etc/kubernetes/pki/etcd/ca.crt \
+--cert=/etc/kubernetes/pki/etcd/server.crt \
+--key=/etc/kubernetes/pki/etcd/server.key"
+
+log() { echo "[etcd-snapshot] $*"; }
+die() { echo "[etcd-snapshot] ERROR: $*" >&2; exit 1; }
+
+CID="$(crictl ps --name etcd -q 2>/dev/null | head -1)"
+[ -n "$CID" ] || die "no running etcd container found via crictl"
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+NAME="etcd-${TS}.db"
+
+# etcdctl runs inside the container, so it can only write where the container
+# can write. /var/lib/etcd is the one host-mounted writable path in kubeadm's
+# etcd pod, so the snapshot is staged there and moved straight out. The name is
+# dot-prefixed while in flight so a half-written file is obviously not a
+# finished snapshot if this dies midway.
+IN_CONTAINER_TMP="/var/lib/etcd/.snapshot-inflight.db"
+HOST_TMP="/var/lib/etcd/.snapshot-inflight.db"
+
+cleanup() { rm -f "$HOST_TMP"; }
+trap cleanup EXIT
+
+log "taking snapshot"
+crictl exec "$CID" etcdctl $CERTS snapshot save "$IN_CONTAINER_TMP" >/dev/null 2>&1 \
+  || die "etcdctl snapshot save failed"
+
+# Verify BEFORE moving it anywhere. `snapshot status` parses the file and reads
+# its hash, so it fails on a truncated or corrupt snapshot -- the difference
+# between having a backup and having a file. It has to run while the snapshot is
+# still inside the container's view, hence the check happening here and not
+# after the move.
+log "verifying snapshot"
+STATUS_JSON="$(crictl exec "$CID" etcdctl snapshot status "$IN_CONTAINER_TMP" --write-out=json 2>/dev/null)" \
+  || die "snapshot verification failed -- refusing to keep an unverifiable file"
+
+REVISION="$(printf '%s' "$STATUS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])' 2>/dev/null || echo 0)"
+KEYS="$(printf '%s' "$STATUS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totalKey"])' 2>/dev/null || echo 0)"
+[ "$KEYS" -gt 0 ] || die "snapshot reports 0 keys -- refusing to keep it"
+log "verified: revision=${REVISION} keys=${KEYS}"
+
+mkdir -p "$STAGE_DIR"
+chmod 0700 "$STAGE_DIR"
+mv "$HOST_TMP" "${STAGE_DIR}/${NAME}"
+trap - EXIT
+chmod 0600 "${STAGE_DIR}/${NAME}"
+
+gzip -f "${STAGE_DIR}/${NAME}"
+ARCHIVE="${STAGE_DIR}/${NAME}.gz"
+log "staged $(du -h "$ARCHIVE" | cut -f1) at ${ARCHIVE}"
+
+if [ "$REMOTE_ENABLED" = "yes" ]; then
+  log "shipping to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"
+  # BatchMode so a missing/refused key fails loudly instead of hanging on a
+  # password prompt inside a systemd unit with no tty.
+  SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+  # shellcheck disable=SC2086
+  ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_PATH}'" \
+    || die "cannot reach ${REMOTE_HOST} -- snapshot is staged locally but NOT off-host"
+  # shellcheck disable=SC2086
+  scp $SSH_OPTS "$ARCHIVE" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/" \
+    || die "copy to ${REMOTE_HOST} failed -- snapshot is staged locally but NOT off-host"
+
+  # Prune the remote copy too. Without this the off-host location grows without
+  # bound, which is how backup targets quietly fill up and start failing.
+  # shellcheck disable=SC2086
+  ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "ls -1t '${REMOTE_PATH}'/etcd-*.db.gz 2>/dev/null | tail -n +$((KEEP_REMOTE + 1)) | xargs -r rm -f" \
+    || log "WARNING: remote prune failed (copy itself succeeded)"
+  log "shipped and pruned remote to ${KEEP_REMOTE}"
+else
+  log "remote shipping DISABLED -- snapshot exists only on this host, which is the machine being protected against"
+fi
+
+# Local staging is a staging area, not the backup. Keep few.
+# shellcheck disable=SC2012
+ls -1t "${STAGE_DIR}"/etcd-*.db.gz 2>/dev/null | tail -n +$((KEEP_LOCAL + 1)) | xargs -r rm -f
+log "done"
