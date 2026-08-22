@@ -1,0 +1,222 @@
+# Turns on Kubernetes Secret encryption at rest, so Secrets are stored in etcd
+# as ciphertext rather than plain base64.
+#
+# Run this on demand — like playbooks/argocd-dex-sso.yml it is deliberately NOT
+# in main.yml's bootstrap chain, because it restarts kube-apiserver and rewrites
+# every Secret in the cluster:
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/etcd-encryption-at-rest.yml
+#
+# Safe to re-run. The encryption key is generated exactly once and never
+# rotated by a re-run — regenerating it would make every already-encrypted
+# Secret undecryptable. To rotate deliberately, see the README section this
+# playbook's final message points at.
+#
+# This is a single-control-plane cluster, so the apiserver restart is a brief
+# full API outage (~15-30s). Nothing running in the cluster stops, but kubectl
+# and ArgoCD will error for that window.
+- name: Enable etcd encryption at rest for Kubernetes Secrets
+  hosts: control_plane
+
+  handlers:
+    # kube-apiserver reads the EncryptionConfiguration only at startup. A
+    # manifest change restarts it via the kubelet on its own, but a change to
+    # just the config file's contents does not — deleting the static pod covers
+    # both cases, and an extra restart is harmless.
+    - name: Restart kube-apiserver
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system delete pod
+        -l component=kube-apiserver --wait=false
+      changed_when: true
+
+  tasks:
+    - name: Assert this host is an initialized control plane
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: etcd_encryption_admin_conf
+      failed_when: not etcd_encryption_admin_conf.stat.exists
+
+    # The manifest patcher below parses the kube-apiserver static pod YAML.
+    - name: Install PyYAML (required by the kube-apiserver manifest patcher)
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: python3-yaml
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create the encryption config directory
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.file:
+        path: "{{ etcd_encryption_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # creates: is what makes this generate-once. Without it a re-run would mint
+    # a new key, and every Secret already written under the old one would become
+    # permanently undecryptable.
+    - name: Generate the AES-CBC encryption key, once and only once
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: >
+        umask 077 && openssl rand -base64 32 > {{ etcd_encryption_key_file }}
+      args:
+        executable: /bin/bash
+        creates: "{{ etcd_encryption_key_file }}"
+
+    - name: Lock down the key file
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.file:
+        path: "{{ etcd_encryption_key_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Read the encryption key back
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.slurp:
+        src: "{{ etcd_encryption_key_file }}"
+      register: etcd_encryption_key_slurp
+
+    - name: Write the EncryptionConfiguration
+      become: true
+      become_method: ansible.builtin.sudo
+      vars:
+        etcd_encryption_key: "{{ etcd_encryption_key_slurp.content | b64decode | trim }}"
+      ansible.builtin.template:
+        src: encryption-config.yaml.j2
+        dest: "{{ etcd_encryption_config_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      notify: Restart kube-apiserver
+
+    # Idempotent: exits 0 when the manifest already points at the config, 2 when
+    # it rewrote it, 1 when the manifest isn't the shape it expects (in which
+    # case it refuses rather than guessing). Keeps a .pre-encryption backup.
+    - name: Wire the EncryptionConfiguration into the kube-apiserver manifest
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.script: >
+        files/kube-apiserver-encryption-patch.py {{ etcd_encryption_config_file }}
+      register: etcd_encryption_manifest_patch
+      changed_when: etcd_encryption_manifest_patch.rc == 2
+      failed_when: etcd_encryption_manifest_patch.rc not in [0, 2]
+      notify: Restart kube-apiserver
+
+    - name: Restart kube-apiserver now, before anything below talks to it
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the API server to come back
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw /healthz
+      register: etcd_encryption_healthz
+      until: etcd_encryption_healthz.rc == 0 and etcd_encryption_healthz.stdout == 'ok'
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    # Encryption only applies on write, so Secrets already in etcd stay
+    # plaintext until something rewrites them. This is the official rewrite-
+    # everything step; it is a no-op on content and safe to repeat.
+    - name: Rewrite every existing Secret so it gets encrypted
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get secrets
+        --all-namespaces -o json |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf replace -f -
+      args:
+        executable: /bin/bash
+      register: etcd_encryption_rewrite
+      changed_when: etcd_encryption_rewrite.stdout is search('replaced')
+
+    - name: Verify encryption by reading a canary Secret straight out of etcd
+      block:
+        - name: Create the canary Secret
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: >
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf
+            -n kube-system create secret generic {{ etcd_encryption_canary_name }}
+            --from-literal=canary=encrypted --save-config
+          changed_when: true
+
+        - name: Find the etcd pod
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: >
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get pod
+            -l component=etcd -o jsonpath={.items[0].metadata.name}
+          register: etcd_encryption_etcd_pod
+          changed_when: false
+
+        # etcdctl returns the raw stored value, which is binary — grep -a keeps
+        # ansible from choking on it, and the count is all we need. Reading it
+        # through the apiserver would prove nothing: the apiserver decrypts.
+        - name: Read the canary's raw etcd value and look for the aescbc prefix
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.shell: >
+            set -o pipefail &&
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system exec
+            {{ etcd_encryption_etcd_pod.stdout }} -- etcdctl
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt
+            --cert=/etc/kubernetes/pki/etcd/server.crt
+            --key=/etc/kubernetes/pki/etcd/server.key
+            get /registry/secrets/kube-system/{{ etcd_encryption_canary_name }} |
+            grep -ac 'k8s:enc:aescbc:v1:{{ etcd_encryption_key_name }}'
+          args:
+            executable: /bin/bash
+          register: etcd_encryption_canary_probe
+          changed_when: false
+          failed_when: false
+
+        - name: Assert the canary is stored encrypted
+          ansible.builtin.assert:
+            that:
+              - etcd_encryption_canary_probe.stdout | trim | int > 0
+            fail_msg: >-
+              The canary Secret is NOT encrypted in etcd — expected the prefix
+              k8s:enc:aescbc:v1:{{ etcd_encryption_key_name }} and did not find
+              it. kube-apiserver is probably running without
+              --encryption-provider-config; check
+              /etc/kubernetes/manifests/kube-apiserver.yaml against its
+              .pre-encryption backup, and check the apiserver's logs with
+              crictl for a failure to read {{ etcd_encryption_config_file }}.
+            success_msg: >-
+              Secrets are encrypted at rest — the canary is stored in etcd
+              under k8s:enc:aescbc:v1:{{ etcd_encryption_key_name }}.
+
+      always:
+        - name: Remove the canary Secret
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: >
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system
+            delete secret {{ etcd_encryption_canary_name }} --ignore-not-found
+          changed_when: true
+
+    - name: Explain what is now protected, and what still isn't
+      ansible.builtin.debug:
+        msg: >-
+          Secrets are now encrypted at rest in etcd with AES-CBC, verified
+          against a canary. The key lives at {{ etcd_encryption_key_file }} on
+          the control plane, mode 0600, and is NOT in git or in Ansible Vault —
+          back it up somewhere safe, because losing it means losing every
+          Secret in the cluster. Note the identity provider is still in the
+          read chain, which is what lets old plaintext values be read; that is
+          correct and should stay. This protects an etcd snapshot or a stolen
+          disk. It does NOT protect against anyone who can reach the apiserver
+          with cluster-admin, since the apiserver decrypts on read.
