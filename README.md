@@ -90,11 +90,12 @@ sides first (see below).
 
 ### Ansible Vault
 
-The Dex OIDC client secret is meant to live ansible-vault-encrypted in
-`inventory/vault/argocd_dex.yml` — that path is gitignored (only
-`inventory/vault/argocd_dex.yml.example`, a template with no real secret, is
-tracked), so a real secret can never land in git unencrypted even by
-accident. It's also kept out of `group_vars`/`host_vars` on purpose, so
+The Dex OIDC client secret lives ansible-vault-encrypted in
+`inventory/vault/argocd_dex.yml`. `inventory/vault/*.yml` is gitignored so a
+real secret can never land in git unencrypted by accident; once a file is
+actually encrypted it is committed deliberately with `git add -f`, which is
+why `argocd_dex.yml` is tracked despite the ignore rule. The
+`.yml.example` templates carry no secret and are tracked normally. It's also kept out of `group_vars`/`host_vars` on purpose, so
 unrelated playbook runs never need the vault password. One-time setup:
 
 ```bash
@@ -127,7 +128,10 @@ cluster. `playbooks/etcd-encryption-at-rest.yml` turns on AES-CBC encryption for
 Secrets:
 
 ```bash
-ansible-playbook -i inventory/hosts.yml playbooks/etcd-encryption-at-rest.yml
+ansible-playbook -i inventory/hosts.yml \
+  -e @inventory/vault/etcd_encryption.yml \
+  --vault-password-file .vault_pass.txt \
+  playbooks/etcd-encryption-at-rest.yml
 ```
 
 Like the Dex SSO playbook this is deliberately **not** in `main.yml` — it
@@ -136,7 +140,7 @@ single-control-plane cluster that restart is a brief full API outage (roughly
 15-30s): running workloads keep running, but `kubectl` and ArgoCD will error
 for that window.
 
-What it does, in order: generates a 32-byte key, writes an
+What it does, in order: installs the 32-byte key from the vault file, writes an
 `EncryptionConfiguration`, wires it into the `kube-apiserver` static pod
 manifest, restarts the apiserver, rewrites every existing Secret so it actually
 gets encrypted, and then verifies the result by reading a canary Secret
@@ -144,14 +148,36 @@ gets encrypted, and then verifies the result by reading a canary Secret
 `k8s:enc:aescbc:v1:key1` prefix. Reading it back through the apiserver would
 prove nothing, since the apiserver decrypts on read.
 
-The playbook is safe to re-run: the key is generated with `creates:` so a re-run
-never mints a new one, and the manifest patcher is idempotent (it keeps a
-`.pre-encryption` backup of the manifest the first time it changes it).
+The playbook is safe to re-run: it installs the same key from the vault every
+time, and the manifest patcher is idempotent. That patcher keeps a
+`.pre-encryption` backup of the manifest the first time it changes it, written
+to `/etc/kubernetes/` — deliberately **outside** `/etc/kubernetes/manifests/`,
+because the kubelet parses every non-hidden file in that directory as a static
+pod. A backup left there becomes a second Pod named `kube-apiserver` carrying
+the old unencrypted spec, and the kubelet will happily run it instead: the
+apiserver comes up with no `--encryption-provider-config`, nothing errors, and
+encryption is silently off.
 
-**Back the key up.** It lives at `/etc/kubernetes/enc/key1.b64` on the control
-plane, mode 0600, and is deliberately *not* in git and *not* in Ansible Vault —
-committing the key next to the encrypted data it protects would defeat the
-point. If you lose that file, every Secret in the cluster is unrecoverable.
+### Where the key lives
+
+The key is **not** generated on the control plane. It is the source of truth in
+`inventory/vault/etcd_encryption.yml`, ansible-vault encrypted and tracked in
+git, exactly like the Dex client secret above; the playbook pushes it out to
+`/etc/kubernetes/enc/key1.b64` (mode 0600).
+
+That is a deliberate reversal of the obvious instinct to keep the key off disk
+and out of the repo. Minting it on the control plane means it exists in exactly
+one place, so losing that single VM loses every Secret in the cluster with no
+way back — a guaranteed total loss traded against a hypothetical one. Storing it
+vault-encrypted means an off-host copy is a *property of where the key lives*
+rather than a backup job someone has to keep running and remember to check, and
+it makes rebuilding a control plane reproducible: the replacement gets the same
+key and can read what is already in etcd.
+
+The tradeoff is real and worth stating plainly: anyone holding **both** this
+repo and `.vault_pass.txt` can decrypt an etcd snapshot. `.vault_pass.txt` stays
+gitignored and out of band in a password manager, which is the whole basis of
+that separation — the same trust model already accepted for the Dex secret.
 
 ### Provider order, and why `identity` stays
 
@@ -175,7 +201,10 @@ under the new one:
 1. Add the new key as a **second** entry under `aescbc.keys` — order matters,
    the first key in the list is the one used for writes, later ones are still
    tried on read. Bump `etcd_encryption_key_name` and add the new secret ahead
-   of the old one.
+   of the old one. Note this needs a template change, not just a new value in
+   the vault file: overwriting `vault_etcd_encryption_key` in place replaces the
+   only key the apiserver knows, which is precisely the failure this sequence
+   exists to avoid.
 2. Restart `kube-apiserver` so it picks the config up.
 3. Rewrite every Secret so they are re-encrypted under the new key:
    `kubectl get secrets --all-namespaces -o json | kubectl replace -f -`
@@ -327,7 +356,7 @@ actually authenticates as.
 │   ├── hosts.yml                 # control_plane / workers / ml groups
 │   ├── group_vars/               # cluster-wide + per-group version pins, VIP, CIDR
 │   ├── host_vars/                # per-worker vars (e.g. ML workload labeling)
-│   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded, gitignored — only *.yml.example is tracked)
+│   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded; gitignored by default, encrypted files committed with git add -f)
 ├── roles/
 │   ├── k8s_common/                # swap, kernel modules, containerd, kubeadm/kubelet/kubectl
 │   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI, ArgoCD install + server.insecure
