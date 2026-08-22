@@ -32,6 +32,31 @@
   register: k8s_control_plane_argocd_apply
   changed_when: k8s_control_plane_argocd_apply.stdout is search('created|configured')
 
+# The gateway (homelab-infra apps/gateway-config) terminates TLS and forwards
+# plain HTTP to argocd-server:80. Left at its default, argocd-server serves
+# TLS itself and 307s every plaintext request to https://<host>/ — which comes
+# straight back through the same gateway, gets terminated again, and forwarded
+# as plaintext again: an infinite redirect loop, not a broken certificate.
+# server.insecure stops argocd-server doing its own TLS/redirect and lets the
+# gateway own it. Merge-patched so the other keys in argocd-cmd-params-cm are
+# left alone.
+- name: Set server.insecure on argocd-cmd-params-cm (TLS terminates at the gateway)
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    -n {{ argocd_namespace }} patch configmap argocd-cmd-params-cm
+    --type merge -p '{"data":{"server.insecure":"true"}}'
+  register: k8s_control_plane_argocd_insecure_patch
+  changed_when: k8s_control_plane_argocd_insecure_patch.stdout is search('patched')
+    and 'no change' not in k8s_control_plane_argocd_insecure_patch.stdout
+  notify: Restart argocd-server
+
+# Flushed immediately rather than left to the end of the play, so the rollout
+# status check below waits on the restarted pod and not the outgoing one.
+- name: Restart argocd-server now if the patch changed anything
+  ansible.builtin.meta: flush_handlers
+
 - name: Wait for the argocd-server deployment to be available
   become: true
   become_method: ansible.builtin.sudo

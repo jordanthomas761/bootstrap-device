@@ -72,6 +72,14 @@ syncs and self-heals everything under `homelab-infra`'s `apps/` on its own
 (Cilium, kube-vip, and ArgoCD itself stay imperative, since none of them can
 manage their own bootstrap).
 
+The install also sets `server.insecure` in `argocd-cmd-params-cm`. The gateway
+in `homelab-infra` (`apps/gateway-config`) terminates TLS and forwards plain
+HTTP to `argocd-server:80`; left at its default `argocd-server` does its own
+TLS and answers every plaintext request with a 307 to `https://<host>/`, which
+comes straight back through the same gateway and is forwarded as plaintext
+again. That is an infinite redirect loop, and it looks like a broken
+certificate when it isn't — the cert is fine, the redirect is the bug.
+
 **Dex SSO login is the one deliberate exception, not automated**: once Dex is
 up via GitOps, run `playbooks/argocd-dex-sso.yml` to patch
 `argocd-cm`/`argocd-secret` in the `argocd` namespace and wire the ArgoCD
@@ -145,7 +153,7 @@ SSO to work. Generate it once here, then seal it there.
 │   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded, gitignored — only *.yml.example is tracked)
 ├── roles/
 │   ├── k8s_common/                # swap, kernel modules, containerd, kubeadm/kubelet/kubectl
-│   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI, ArgoCD install
+│   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI, ArgoCD install + server.insecure
 │   └── k8s_worker/                # kubeadm join
 ├── files/
 │   └── 45-allow-colord.pkla     # Polkit policy for Colord

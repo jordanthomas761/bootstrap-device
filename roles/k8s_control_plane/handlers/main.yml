@@ -1,0 +1,10 @@
+---
+# argocd-server reads argocd-cmd-params-cm only at startup, so patching that
+# ConfigMap is inert until the pod is replaced.
+- name: Restart argocd-server
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    -n {{ argocd_namespace }} rollout restart deployment/argocd-server
+  changed_when: true
