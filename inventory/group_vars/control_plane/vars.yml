@@ -53,7 +53,6 @@ etcd_encryption_canary_name: etcd-encryption-canary
 # covers confidentiality. Encryption does nothing for losing the machine.
 etcd_snapshot_stage_dir: /var/backups/etcd
 etcd_snapshot_script: /usr/local/sbin/etcd-snapshot.sh
-etcd_snapshot_ssh_key: /root/.ssh/id_ed25519_etcd_snapshot
 # systemd OnCalendar. Every 6h: etcd is ~15 MiB after a defrag, so frequency is
 # cheap, and 6h bounds how much cluster state a restore would roll back.
 etcd_snapshot_on_calendar: "*-*-* 00,06,12,18:00:00"
@@ -62,8 +61,18 @@ etcd_snapshot_on_calendar: "*-*-* 00,06,12,18:00:00"
 # 28 x 6h is a week.
 etcd_snapshot_keep_local: 3
 etcd_snapshot_keep_remote: 28
-# Where snapshots are shipped. The playbook enables shipping only once this
-# host is actually reachable with etcd_snapshot_ssh_key — see the playbook.
-etcd_snapshot_remote_user: "{{ nas_backup_user | default('backup') }}"
-etcd_snapshot_remote_host: nas.biwbass.xyz
-etcd_snapshot_remote_path: "{{ nas_backup_path | default('/volume1/backups/etcd') }}"
+# Where snapshots are shipped. NFS rather than scp/rsync: DSM only grants SSH
+# to accounts in the administrators group, so an SSH copy would mean parking a
+# NAS-admin key on the control plane. An export restricted to this host's IP
+# needs no account and stores no credential at all.
+#
+# The playbook enables shipping only after it actually mounts this export and
+# writes to it -- see playbooks/etcd-snapshot-backup.yml.
+etcd_snapshot_nfs_host: nas.biwbass.xyz
+etcd_snapshot_nfs_export: /volume1/backups
+etcd_snapshot_nfs_subdir: etcd
+etcd_snapshot_nfs_mountpoint: /mnt/etcd-snapshots
+# hard so a copy blocks and retries rather than failing half-written if the NAS
+# blips; nolock because no file locking is needed and lockd adds another moving
+# part; the timeouts keep a dead NAS from wedging the run indefinitely.
+etcd_snapshot_nfs_options: "hard,nolock,timeo=150,retrans=3,noatime"

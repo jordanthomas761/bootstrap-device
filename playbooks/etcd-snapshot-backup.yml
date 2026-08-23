@@ -35,49 +35,41 @@
         group: root
         mode: "0700"
 
-    # Generated here, not by hand, so the private half never leaves the control
-    # plane. Ansible cannot install the public half on the Synology -- that
-    # needs a NAS login -- so the playbook prints it and stops short of
-    # enabling remote shipping until the key actually works.
-    # ssh-keygen with creates: rather than community.crypto.openssh_keypair --
-    # that collection is not in requirements.yml and pulling in a dependency for
-    # one keypair is not worth it. creates: makes this generate-once: a re-run
-    # must never mint a new key, or the public half already installed on the
-    # NAS would stop matching and shipping would break silently.
-    - name: Generate a dedicated SSH key for shipping snapshots, once
+    # NFS, not scp. DSM only grants SSH to accounts in the administrators
+    # group, so an SSH-based copy would mean parking a key on the control plane
+    # that grants NAS admin -- on the machine most exposed to the cluster, and
+    # the same NAS that serves the directory. An NFS export restricted to this
+    # host's IP needs no account and stores no credential.
+    #
+    # Probed by actually mounting it. Checking that the port answers would prove
+    # only that NFS is running, not that this host is allowed in or that the
+    # export is writable, and both of those fail silently at 06:00 otherwise.
+    - name: Test whether the snapshot export can be mounted and written
       become: true
       become_method: ansible.builtin.sudo
-      ansible.builtin.command: >
-        ssh-keygen -t ed25519 -N "" -f {{ etcd_snapshot_ssh_key }}
-        -C "etcd-snapshot-backup@{{ inventory_hostname }}"
+      ansible.builtin.shell: |
+        set -o pipefail
+        MNT=$(mktemp -d)
+        trap 'umount "$MNT" 2>/dev/null; rmdir "$MNT" 2>/dev/null' EXIT
+        mount -t nfs -o {{ etcd_snapshot_nfs_options }} \
+          {{ etcd_snapshot_nfs_host }}:{{ etcd_snapshot_nfs_export }} "$MNT" || exit 10
+        mkdir -p "$MNT/{{ etcd_snapshot_nfs_subdir }}" || exit 11
+        touch "$MNT/{{ etcd_snapshot_nfs_subdir }}/.write-probe" || exit 12
+        rm -f "$MNT/{{ etcd_snapshot_nfs_subdir }}/.write-probe"
+        exit 0
       args:
-        creates: "{{ etcd_snapshot_ssh_key }}"
-
-    - name: Read the public key back
-      become: true
-      become_method: ansible.builtin.sudo
-      ansible.builtin.slurp:
-        src: "{{ etcd_snapshot_ssh_key }}.pub"
-      register: etcd_snapshot_pubkey
-
-    - name: Check whether the snapshot host is already reachable with that key
-      become: true
-      become_method: ansible.builtin.sudo
-      ansible.builtin.command: >
-        ssh -i {{ etcd_snapshot_ssh_key }}
-        -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
-        {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }} true
-      register: etcd_snapshot_ssh_probe
+        executable: /bin/bash
+      register: etcd_snapshot_nfs_probe
       changed_when: false
       failed_when: false
 
-    # Remote shipping turns itself on only once the key demonstrably works.
-    # Writing the config as if it worked would produce a timer that looks
-    # healthy in `systemctl list-timers` while every run fails to leave the
-    # host -- the exact failure mode a backup must not have.
+    # Remote shipping turns itself on only once the export demonstrably works.
+    # Writing the config as if it did would produce a timer that looks healthy
+    # in `systemctl list-timers` while every run fails to leave the host -- the
+    # exact failure mode a backup must not have.
     - name: Decide whether remote shipping can be enabled
       ansible.builtin.set_fact:
-        etcd_snapshot_remote_enabled: "{{ etcd_snapshot_ssh_probe.rc == 0 }}"
+        etcd_snapshot_remote_enabled: "{{ etcd_snapshot_nfs_probe.rc == 0 }}"
 
     - name: Install the snapshot script
       become: true
@@ -171,12 +163,15 @@
           Shipping off-host to {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }}:{{ etcd_snapshot_remote_path }},
           keeping {{ etcd_snapshot_keep_remote }} there.
           {% else %}
-          REMOTE SHIPPING IS OFF -- snapshots exist only on this control plane,
-          which is the machine this is supposed to protect against losing. To
-          turn it on, add this public key to
-          {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }} and
-          re-run this playbook:
-          {{ etcd_snapshot_pubkey.content | b64decode | trim }}
+          REMOTE SHIPPING IS OFF -- snapshots exist only on this control
+          plane, which is the machine this is supposed to protect against
+          losing. The NFS probe exited
+          {{ etcd_snapshot_nfs_probe.rc }} (10 = could not mount, 11 = mounted
+          but could not create {{ etcd_snapshot_nfs_subdir }}, 12 = created but
+          not writable -- 11 and 12 usually mean the export's squash setting is
+          mapping root to a user without write access). Fix the export for
+          {{ etcd_snapshot_nfs_host }}:{{ etcd_snapshot_nfs_export }} and re-run
+          this playbook; it enables itself once the probe passes.
           {% endif %}
 
   handlers:

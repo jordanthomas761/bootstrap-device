@@ -15,10 +15,11 @@ STAGE_DIR="{{ etcd_snapshot_stage_dir }}"
 KEEP_LOCAL={{ etcd_snapshot_keep_local }}
 KEEP_REMOTE={{ etcd_snapshot_keep_remote }}
 REMOTE_ENABLED="{{ 'yes' if etcd_snapshot_remote_enabled else 'no' }}"
-REMOTE_USER="{{ etcd_snapshot_remote_user }}"
-REMOTE_HOST="{{ etcd_snapshot_remote_host }}"
-REMOTE_PATH="{{ etcd_snapshot_remote_path }}"
-SSH_KEY="{{ etcd_snapshot_ssh_key }}"
+NFS_HOST="{{ etcd_snapshot_nfs_host }}"
+NFS_EXPORT="{{ etcd_snapshot_nfs_export }}"
+NFS_OPTIONS="{{ etcd_snapshot_nfs_options }}"
+NFS_MOUNTPOINT="{{ etcd_snapshot_nfs_mountpoint }}"
+NFS_SUBDIR="{{ etcd_snapshot_nfs_subdir }}"
 
 CERTS="--cacert=/etc/kubernetes/pki/etcd/ca.crt \
 --cert=/etc/kubernetes/pki/etcd/server.crt \
@@ -73,24 +74,51 @@ ARCHIVE="${STAGE_DIR}/${NAME}.gz"
 log "staged $(du -h "$ARCHIVE" | cut -f1) at ${ARCHIVE}"
 
 if [ "$REMOTE_ENABLED" = "yes" ]; then
-  log "shipping to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"
-  # BatchMode so a missing/refused key fails loudly instead of hanging on a
-  # password prompt inside a systemd unit with no tty.
-  SSH_OPTS="-i ${SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
-  # shellcheck disable=SC2086
-  ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_PATH}'" \
-    || die "cannot reach ${REMOTE_HOST} -- snapshot is staged locally but NOT off-host"
-  # shellcheck disable=SC2086
-  scp $SSH_OPTS "$ARCHIVE" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/" \
-    || die "copy to ${REMOTE_HOST} failed -- snapshot is staged locally but NOT off-host"
+  # NFS rather than scp/rsync, because DSM only grants SSH to accounts in the
+  # administrators group -- so an SSH-based copy would mean parking a key that
+  # grants NAS admin on the control plane, which is the machine most exposed to
+  # the cluster. An NFS export restricted to this host's IP needs no account and
+  # no stored credential at all.
+  log "mounting ${NFS_HOST}:${NFS_EXPORT}"
+  mkdir -p "$NFS_MOUNTPOINT"
 
-  # Prune the remote copy too. Without this the off-host location grows without
-  # bound, which is how backup targets quietly fill up and start failing.
-  # shellcheck disable=SC2086
-  ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-    "ls -1t '${REMOTE_PATH}'/etcd-*.db.gz 2>/dev/null | tail -n +$((KEEP_REMOTE + 1)) | xargs -r rm -f" \
-    || log "WARNING: remote prune failed (copy itself succeeded)"
-  log "shipped and pruned remote to ${KEEP_REMOTE}"
+  # Always unmount on the way out, including on failure. A left-behind mount
+  # makes the next run look like it succeeded against a stale handle, and a
+  # hung NFS mount on the control plane is its own problem.
+  nfs_cleanup() { umount "$NFS_MOUNTPOINT" 2>/dev/null || true; }
+
+  mount -t nfs -o "$NFS_OPTIONS" "${NFS_HOST}:${NFS_EXPORT}" "$NFS_MOUNTPOINT" \
+    || die "cannot mount ${NFS_HOST}:${NFS_EXPORT} -- snapshot is staged locally but NOT off-host"
+  trap nfs_cleanup EXIT
+
+  DEST="${NFS_MOUNTPOINT}/${NFS_SUBDIR}"
+  mkdir -p "$DEST" || die "cannot create ${DEST} on the export -- check the export's squash setting"
+
+  # Copy to a temp name and rename into place. A rename within the same
+  # filesystem is atomic, so a run interrupted mid-copy never leaves a
+  # half-written file that looks like a finished snapshot.
+  cp "$ARCHIVE" "${DEST}/.$(basename "$ARCHIVE").partial" \
+    || die "copy to ${DEST} failed -- snapshot is staged locally but NOT off-host"
+  mv "${DEST}/.$(basename "$ARCHIVE").partial" "${DEST}/$(basename "$ARCHIVE")" \
+    || die "rename on ${DEST} failed"
+
+  # Verify it is actually there and the right size, rather than trusting that
+  # cp returned 0 against a mount that silently went read-only.
+  SRC_SIZE=$(stat -c%s "$ARCHIVE")
+  DST_SIZE=$(stat -c%s "${DEST}/$(basename "$ARCHIVE")" 2>/dev/null || echo 0)
+  [ "$SRC_SIZE" = "$DST_SIZE" ] \
+    || die "off-host copy is ${DST_SIZE} bytes but the source is ${SRC_SIZE} -- not trusting it"
+
+  # Prune the off-host copies too, or the export grows without bound -- which is
+  # how backup targets quietly fill up and start failing.
+  # shellcheck disable=SC2012
+  ls -1t "${DEST}"/etcd-*.db.gz 2>/dev/null | tail -n +$((KEEP_REMOTE + 1)) | xargs -r rm -f \
+    || log "WARNING: remote prune failed (the copy itself succeeded)"
+
+  REMOTE_COUNT=$(ls -1 "${DEST}"/etcd-*.db.gz 2>/dev/null | wc -l)
+  nfs_cleanup
+  trap - EXIT
+  log "shipped ${SRC_SIZE} bytes off-host; ${REMOTE_COUNT} snapshot(s) now on the export"
 else
   log "remote shipping DISABLED -- snapshot exists only on this host, which is the machine being protected against"
 fi
