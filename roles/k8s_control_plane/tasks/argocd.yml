@@ -26,15 +26,44 @@
   when: k8s_control_plane_argocd_ns_check.rc != 0
   changed_when: true
 
+# --server-side is required, not a preference. A client-side apply copies the
+# entire manifest into the kubectl.kubernetes.io/last-applied-configuration
+# annotation, and applicationsets.argoproj.io is large enough that the copy
+# exceeds the 262144-byte ceiling on annotations:
+#
+#   The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+#   metadata.annotations: Too long: must have at most 262144 bytes
+#
+# Everything before it in the manifest applies, the CRD does not, and the task
+# fails with a partial install. Server-side apply keeps field ownership in
+# managedFields instead and writes no such annotation, so the size problem
+# does not arise.
+#
+# The homelab-infra repo hits the same class of failure from the other side --
+# see the ServerSideApply=true syncOption on apps/kube-prometheus-stack, where
+# six oversized prometheus-operator CRDs blew through etcd's 1.5MB request cap
+# for the same reason.
+#
+# --force-conflicts is needed on the migration: these objects already carry
+# fields owned by the "kubectl-client-side-apply" manager from previous runs,
+# and without it every one of them reports a conflict instead of applying.
+# It does not widen what this task already touches -- the client-side apply it
+# replaces was overwriting the same objects on every run (argocd-cm included,
+# per the "configured" lines in its output).
 - name: Install ArgoCD (non-HA manifest)
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.command: >
     kubectl --kubeconfig=/etc/kubernetes/admin.conf
-    apply -n {{ argocd_namespace }}
+    apply --server-side --force-conflicts -n {{ argocd_namespace }}
     -f https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml
   register: k8s_control_plane_argocd_apply
-  changed_when: k8s_control_plane_argocd_apply.stdout is search('created|configured')
+  # "serverside-applied" is the wording server-side apply uses; a client-side
+  # apply says "created"/"configured". Both are matched because dropping the
+  # old terms would misreport any run that still went client-side, and
+  # dropping the new one would make this task permanently report "ok" while
+  # silently changing things.
+  changed_when: k8s_control_plane_argocd_apply.stdout is search('created|configured|serverside-applied')
 
 # The gateway (homelab-infra apps/gateway-config) terminates TLS and forwards
 # plain HTTP to argocd-server:80. Left at its default, argocd-server serves
