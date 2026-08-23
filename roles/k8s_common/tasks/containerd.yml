@@ -98,6 +98,31 @@
   tags:
     - registry-mirrors
 
+# containerd 2.x only -- the key does not exist on 1.7, where this is a no-op.
+#
+# With use_local_image_pull = false (the 2.x default) the CRI plugin hands
+# pulls to the Transfer Service, and upstream's own compatibility table gives
+# that path only partial registry support, against "all supported" for the
+# client-based local pull. Setting it true puts the control plane on the same
+# pull path as the 1.7 workers, which demonstrably use the caches.
+#
+# This was arrived at the hard way. Populating the Transfer Service's own
+# config_path was not enough on its own: with the certs directory set on both
+# that plugin AND the registry table, containerd restarted, hosts.toml files
+# in place, DNS resolving and HTTPS to the cache working from the node, a
+# fresh `crictl pull` still completed in ~700ms with the cache logging zero
+# requests. containerd's own journal showed no mirror resolution at all.
+- name: Use the local image pull path so registry mirrors are honoured
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: '^(\s*)use_local_image_pull\s*=\s*false\s*$'
+    replace: '\1use_local_image_pull = true'
+  notify: Restart containerd
+  tags:
+    - registry-mirrors
+
 - name: Ensure containerd is enabled and running
   become: true
   become_method: ansible.builtin.sudo
