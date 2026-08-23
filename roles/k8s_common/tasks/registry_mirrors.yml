@@ -44,51 +44,59 @@
   # and containerd.yml owns those.
 
 # Everything above is inert unless containerd actually loaded config_path for
-# the REGISTRY plugin. Assert it, because the failure is silent: pulls keep
-# succeeding, they just never touch the cache, and nobody notices for months.
+# whichever component performs pulls. Assert it, because the failure mode is
+# silence: pulls keep succeeding via the hosts.toml fallback, they just never
+# touch the cache, and nothing anywhere reports a problem.
 #
-# This deliberately re-reads and scopes to the registry table rather than
-# grepping the whole `containerd config dump` for the certs directory. A
-# whole-file substring check passes vacuously on containerd 2.x, where
-# Ubuntu's default already puts /etc/containerd/certs.d on an unrelated line
-# -- so the check would have reported success on the control plane no matter
-# what the role did, which is worse than having no check at all.
-- name: Re-read containerd's effective registry config_path
+# The check is "no config_path is left empty", NOT "the registry table
+# mentions the certs directory". The earlier, narrower version passed
+# vacuously on the control plane: containerd 2.x ships the registry path
+# already populated, so it reported success while pulls were bypassing the
+# cache entirely through the transfer service, whose own config_path was
+# still empty. See containerd.yml for the full explanation of which key
+# matters on which major.
+#
+# Anchored on `config_path` exactly so plugin_config_path -- a different
+# setting that merely contains the string -- is not counted.
+- name: Read containerd's resolved configuration
   become: true
   become_method: ansible.builtin.sudo
-  ansible.builtin.shell:
-    cmd: |
-      set -o pipefail
-      containerd config dump | awk '/\.registry\]$/ {f=1} f && /config_path/ {print; exit}'
-    executable: /bin/bash
-  register: k8s_common_containerd_registry_config_path_final
+  ansible.builtin.command: containerd config dump
+  register: k8s_common_containerd_config_dump
   changed_when: false
+
+- name: Find any registry config_path containerd still has unset
+  ansible.builtin.set_fact:
+    k8s_common_empty_config_paths: >-
+      {{ k8s_common_containerd_config_dump.stdout_lines
+         | select('match', '^\s*config_path\s*=\s*(''|"")\s*$')
+         | list }}
 
 - name: Assert containerd is reading the registry configuration directory
   ansible.builtin.assert:
     that:
-      - k8s_common_registry_certs_dir in k8s_common_containerd_registry_config_path_final.stdout
+      - k8s_common_registry_certs_dir in k8s_common_containerd_config_dump.stdout
+      - k8s_common_empty_config_paths | length == 0
     fail_msg: >-
-      containerd on {{ inventory_hostname }} is not reading
-      {{ k8s_common_registry_certs_dir }} for the registry plugin, so the
-      hosts.toml files just written are ignored and every pull still goes
-      straight to the upstream registry.
-      The registry table resolved to:
-      "{{ k8s_common_containerd_registry_config_path_final.stdout | default('<no config_path found under any .registry] table>') }}".
-      In the order worth checking:
-      (1) the value is empty -- the `Point containerd at the registry
-      configuration directory` task in containerd.yml did not match this
-      node's config.toml. Compare the quoting (containerd 1.7 emits "" and 2.x
-      emits '') and the enclosing table, which also differs between majors.
-      (2) the value is a different, deliberately-chosen directory -- then set
-      `k8s_common_registry_certs_dir` to that path (per-host or per-group)
-      rather than changing the node, and this role will write the hosts.toml
-      files where containerd already looks. Note the value may be a
-      colon-separated LIST, which is fine as long as it contains ours.
-      (3) nothing printed at all -- the awk found no `.registry]` table, which
-      means the config schema moved again; inspect
-      `containerd config dump` by hand.
+      containerd on {{ inventory_hostname }} is not fully pointed at
+      {{ k8s_common_registry_certs_dir }}, so at least one component will
+      ignore the hosts.toml files just written and pull straight from the
+      upstream registry.
+      {% if k8s_common_empty_config_paths | length > 0 %}
+      {{ k8s_common_empty_config_paths | length }} config_path key(s) are
+      still empty: {{ k8s_common_empty_config_paths | join(' | ') }}.
+      On containerd 2.x the one that matters for pulls belongs to
+      [plugins.'io.containerd.transfer.v1.local'], NOT to the registry table,
+      because use_local_image_pull defaults to false and delegates pulls to
+      the transfer service.
+      {% else %}
+      No empty keys remain, but the certs directory does not appear at all --
+      the `Point containerd at the registry configuration directory` task in
+      containerd.yml did not match this node's config.toml. Compare the
+      quoting: containerd 1.7 emits "" and 2.x emits ''.
+      {% endif %}
+      Inspect with `sudo containerd config dump | grep -n config_path`.
     success_msg: >-
-      containerd registry config_path is
-      "{{ k8s_common_containerd_registry_config_path_final.stdout | trim }}"
+      containerd is reading {{ k8s_common_registry_certs_dir }} with no
+      config_path left unset
       ({{ k8s_common_registry_mirrors | length }} mirrors configured)

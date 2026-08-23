@@ -53,46 +53,45 @@
     replace: '\1bin_dir = "/opt/cni/bin"'
   notify: Restart containerd
 
-# Read the config_path that belongs to the CRI *registry* table specifically,
-# rather than trusting that the first config_path in the file is the right
-# one. The awk latches on the first table header ending in `.registry]` and
-# prints the next config_path under it, which lands on
-# io.containerd.grpc.v1.cri.registry (containerd 1.7) or
-# io.containerd.cri.v1.images.registry (2.x) without hardcoding either.
-- name: Read containerd's effective registry config_path
-  become: true
-  become_method: ansible.builtin.sudo
-  ansible.builtin.shell:
-    cmd: |
-      set -o pipefail
-      containerd config dump | awk '/\.registry\]$/ {f=1} f && /config_path/ {print; exit}'
-    executable: /bin/bash
-  register: k8s_common_containerd_registry_config_path
-  changed_when: false
-
-# Only rewrite when the registry's config_path is not already pointing at the
-# certs directory. This guard is what makes the regex below safe.
+# Populate EVERY empty config_path in config.toml, not just the registry
+# table's. This looks blunt and is deliberate -- which key matters depends on
+# the containerd major, and on 2.x it is NOT the registry one.
 #
-# Without it the task is actively wrong on containerd 2.x: Ubuntu's build
-# already ships
+# containerd 1.7 (the Debian workers):
+#   [plugins."io.containerd.grpc.v1.cri".registry]
+#     config_path = ""          <- the CRI plugin pulls, and reads this
+#
+# containerd 2.x (the Ubuntu control plane):
+#   [plugins.'io.containerd.cri.v1.images']
+#     use_local_image_pull = false   <- pulls are DELEGATED to the transfer
+#                                       service, not done by the CRI plugin
 #   [plugins.'io.containerd.cri.v1.images'.registry]
 #     config_path = '/etc/containerd/certs.d:/etc/docker/certs.d'
-# so there is nothing to do -- and the first EMPTY config_path in that file
-# belongs to [plugins.'io.containerd.transfer.v1.local'], an unrelated plugin
-# that the regex would have silently rewritten instead. Observed on the
-# control plane; the Debian 1.7 workers have no such key, which is why they
-# were fine.
+#                                   <- already correct out of the box, and
+#                                      IRRELEVANT to pulls while the above is
+#                                      false
+#   [plugins.'io.containerd.transfer.v1.local']
+#     config_path = ''          <- the key that actually governs mirroring
+#
+# Verified the hard way on this cluster: with only the registry path set, the
+# control plane pulled a fresh image and the cache logged zero requests, while
+# DNS and HTTPS to the cache both worked fine from that node. It was silently
+# taking the hosts.toml fallback to the upstream registry every time.
+#
+# Setting every empty config_path is safe because the value is only ever read
+# as "where do I find registry hosts.toml files", and pointing any puller at
+# the same directory is exactly the intent. It is idempotent for the usual
+# reason: the pattern matches empty values only.
 - name: Point containerd at the registry configuration directory
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.replace:
     path: /etc/containerd/config.toml
-    # Matches only the EMPTY value that `containerd config default` emits, so
-    # it is idempotent. Both quotings are accepted because the two containerd
-    # majors disagree -- 1.7 writes "" and 2.x writes ''.
+    # Both quotings, because 1.7 emits "" and 2.x emits ''. Anchored on the
+    # exact key so it cannot touch plugin_config_path, which merely contains
+    # "config_path" as a substring.
     regexp: "^(\\s*)config_path\\s*=\\s*(''|\"\")\\s*$"
     replace: '\1config_path = "{{ k8s_common_registry_certs_dir }}"'
-  when: k8s_common_registry_certs_dir not in k8s_common_containerd_registry_config_path.stdout
   notify: Restart containerd
 
 - name: Ensure containerd is enabled and running
