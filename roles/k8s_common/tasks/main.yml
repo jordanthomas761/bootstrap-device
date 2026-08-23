@@ -1,10 +1,39 @@
 ---
+# Deliberately non-fatal, which is not the same as ignoring the result.
+#
+# This is a warm-up before the prerequisite installs below. At this point in
+# the role a third-party repo definition may still be wrong -- including the
+# Kubernetes one that kube_packages.yml is responsible for CORRECTING. Hard
+# failing here makes the role unable to repair the state it exists to manage:
+# a node whose kubernetes.sources holds a bad URL dies at task 1 on every run,
+# and the task three files later that would rewrite it never executes. That is
+# exactly what happened to the control plane, while a worker sailed past the
+# same broken file only because cache_valid_time happened to skip the refresh
+# that run.
+#
+# Nothing is swallowed. kube_packages.yml rewrites the repo and then notifies
+# "Update Kubernetes apt cache", flushed immediately afterwards, and that
+# refresh is NOT tolerant -- a genuinely unreachable or misconfigured repo
+# still fails the play, just after the role has had its one chance to fix the
+# definition. The debug below reports the deferral so it is visible in the run
+# rather than inferred from a missing "ok".
 - name: Update apt cache
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.apt:
     update_cache: true
     cache_valid_time: 3600
+  register: k8s_common_apt_cache_warm
+  failed_when: false
+
+- name: Report a deferred apt cache refresh
+  ansible.builtin.debug:
+    msg: >-
+      Initial apt cache refresh did not succeed and has been deferred. Repo
+      definitions are corrected later in this role, and the authoritative
+      refresh in kube_packages.yml will fail the play if the problem persists.
+      Original error: {{ k8s_common_apt_cache_warm.msg | default('unknown') }}
+  when: k8s_common_apt_cache_warm.msg | default('') is search('Failed to update apt cache')
 
 - name: Disable swap
   ansible.builtin.import_tasks: swap.yml
