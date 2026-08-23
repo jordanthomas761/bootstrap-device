@@ -69,6 +69,41 @@ mv "$HOST_TMP" "${STAGE_DIR}/${NAME}"
 trap - EXIT
 chmod 0600 "${STAGE_DIR}/${NAME}"
 
+# --- companion artifacts -------------------------------------------------
+#
+# An etcd snapshot on its own does NOT restore a cluster. Every ServiceAccount
+# token in it was signed by sa.key and every kubelet and admin certificate by
+# ca.key, both of which live on the filesystem and are NOT inside the snapshot.
+# Restore a snapshot onto a control plane with a freshly generated CA and you
+# get a cluster holding all the right data where nothing can authenticate.
+# So the PKI ships alongside, sharing the snapshot's timestamp to make the
+# pairing obvious at restore time.
+PKI_ARCHIVE="${STAGE_DIR}/pki-${TS}.tar.gz"
+tar czf "$PKI_ARCHIVE" -C /etc/kubernetes pki 2>/dev/null \
+  && chmod 600 "$PKI_ARCHIVE" \
+  && log "packaged control-plane PKI ($(du -h "$PKI_ARCHIVE" | cut -f1))" \
+  || { rm -f "$PKI_ARCHIVE"; PKI_ARCHIVE=""; log "WARNING: could not package /etc/kubernetes/pki"; }
+
+# The Sealed Secrets controller key. Losing it makes every SealedSecret in git
+# permanently undecryptable. It is technically inside the etcd snapshot already
+# -- it is a Secret in kube-system -- but recovering it that way means restoring
+# etcd first and having the at-rest encryption key to hand. A direct copy turns
+# a three-step recovery into a one-step one.
+#
+# Best effort on purpose: this is the only part of the script that needs a
+# working apiserver, and a snapshot taken while the API is down is exactly the
+# snapshot worth keeping. A failure here must never fail the run.
+SS_ARCHIVE="${STAGE_DIR}/sealed-secrets-keys-${TS}.yaml"
+if kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get secret \
+     -l sealedsecrets.bitnami.com/sealed-secrets-key -o yaml > "$SS_ARCHIVE" 2>/dev/null \
+   && grep -q "tls.key" "$SS_ARCHIVE"; then
+  chmod 600 "$SS_ARCHIVE"
+  log "exported sealed-secrets controller key(s)"
+else
+  rm -f "$SS_ARCHIVE"; SS_ARCHIVE=""
+  log "WARNING: could not export sealed-secrets keys (apiserver down?) -- continuing"
+fi
+
 gzip -f "${STAGE_DIR}/${NAME}"
 ARCHIVE="${STAGE_DIR}/${NAME}.gz"
 log "staged $(du -h "$ARCHIVE" | cut -f1) at ${ARCHIVE}"
@@ -97,10 +132,25 @@ if [ "$REMOTE_ENABLED" = "yes" ]; then
   # Copy to a temp name and rename into place. A rename within the same
   # filesystem is atomic, so a run interrupted mid-copy never leaves a
   # half-written file that looks like a finished snapshot.
-  cp "$ARCHIVE" "${DEST}/.$(basename "$ARCHIVE").partial" \
+  # Copy to a dot-prefixed temp name and rename into place. A rename within one
+  # filesystem is atomic, so an interrupted run never leaves a half-written file
+  # that looks like a finished snapshot.
+  ship() {
+    local src="$1" base
+    base=$(basename "$src")
+    cp "$src" "${DEST}/.${base}.partial" || return 1
+    mv "${DEST}/.${base}.partial" "${DEST}/${base}" || return 1
+    return 0
+  }
+
+  ship "$ARCHIVE" \
     || die "copy to ${DEST} failed -- snapshot is staged locally but NOT off-host"
-  mv "${DEST}/.$(basename "$ARCHIVE").partial" "${DEST}/$(basename "$ARCHIVE")" \
-    || die "rename on ${DEST} failed"
+
+  # The companions are shipped best-effort: a snapshot that reached the far end
+  # is worth keeping even if the PKI copy failed, and dying here would leave the
+  # export holding a snapshot while the run reports failure.
+  [ -n "$PKI_ARCHIVE" ] && { ship "$PKI_ARCHIVE" && log "shipped PKI" || log "WARNING: PKI copy failed"; }
+  [ -n "$SS_ARCHIVE" ]  && { ship "$SS_ARCHIVE"  && log "shipped sealed-secrets keys" || log "WARNING: sealed-secrets copy failed"; }
 
   # Verify it is actually there and the right size, rather than trusting that
   # cp returned 0 against a mount that silently went read-only.
@@ -112,8 +162,11 @@ if [ "$REMOTE_ENABLED" = "yes" ]; then
   # Prune the off-host copies too, or the export grows without bound -- which is
   # how backup targets quietly fill up and start failing.
   # shellcheck disable=SC2012
-  ls -1t "${DEST}"/etcd-*.db.gz 2>/dev/null | tail -n +$((KEEP_REMOTE + 1)) | xargs -r rm -f \
-    || log "WARNING: remote prune failed (the copy itself succeeded)"
+  for pat in 'etcd-*.db.gz' 'pki-*.tar.gz' 'sealed-secrets-keys-*.yaml'; do
+    # shellcheck disable=SC2012
+    ls -1t "${DEST}"/$pat 2>/dev/null | tail -n +$((KEEP_REMOTE + 1)) | xargs -r rm -f \
+      || log "WARNING: remote prune of $pat failed (the copy itself succeeded)"
+  done
 
   REMOTE_COUNT=$(ls -1 "${DEST}"/etcd-*.db.gz 2>/dev/null | wc -l)
   nfs_cleanup
@@ -125,5 +178,8 @@ fi
 
 # Local staging is a staging area, not the backup. Keep few.
 # shellcheck disable=SC2012
-ls -1t "${STAGE_DIR}"/etcd-*.db.gz 2>/dev/null | tail -n +$((KEEP_LOCAL + 1)) | xargs -r rm -f
+for pat in 'etcd-*.db.gz' 'pki-*.tar.gz' 'sealed-secrets-keys-*.yaml'; do
+  # shellcheck disable=SC2012
+  ls -1t "${STAGE_DIR}"/$pat 2>/dev/null | tail -n +$((KEEP_LOCAL + 1)) | xargs -r rm -f
+done
 log "done"

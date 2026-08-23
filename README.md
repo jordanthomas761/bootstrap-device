@@ -292,6 +292,38 @@ of real data, which would have made every snapshot 50x larger than necessary.
 Check with `etcdctl endpoint status --write-out=json` and compare `dbSize`
 against `dbSizeInUse`; if the gap is large, `etcdctl defrag` reclaims it.
 
+### What ships alongside each snapshot
+
+Three files share a timestamp on every run:
+
+| File | Why |
+| --- | --- |
+| `etcd-<ts>.db.gz` | The snapshot itself |
+| `pki-<ts>.tar.gz` | `/etc/kubernetes/pki` — **required to make the snapshot restorable** |
+| `sealed-secrets-keys-<ts>.yaml` | The Sealed Secrets controller key |
+
+**The PKI is not optional.** An etcd snapshot restores *data*, but every
+ServiceAccount token inside it was signed by `sa.key`, and every kubelet and
+admin certificate by `ca.key` — neither of which is in the snapshot, because
+both live on the filesystem. Restore a snapshot onto a control plane with a
+freshly generated CA and you get a cluster holding all the right data in which
+nothing can authenticate and no node can rejoin. They share a timestamp so the
+matching pair is obvious at 3am.
+
+The Sealed Secrets key is shipped because losing it makes every SealedSecret in
+git permanently undecryptable. It is technically already inside the snapshot —
+it is a Secret in `kube-system` — but recovering it that way means restoring
+etcd first *and* having the at-rest encryption key to hand. The direct copy
+turns a three-step recovery into one step. Its export is best-effort by design:
+it is the only part of the run that needs a working apiserver, and a snapshot
+taken while the API is down is exactly the snapshot worth keeping, so a failure
+there never fails the run.
+
+Both are pruned on the same retention as the snapshots, and both are written
+mode 0600. Treat the export as a secret store: it holds CA private keys, the
+Sealed Secrets key, and etcd snapshots whose ConfigMaps are plaintext. The
+IP-restricted export and `No mapping` squash are doing real work.
+
 ### Restoring
 
 Snapshots restore into a *new* data directory — restore never writes over a
@@ -310,7 +342,11 @@ live one. To recover a control plane:
 4. Move the old data dir aside and put the restored one at `/var/lib/etcd`.
 5. Move the manifests back. The kubelet restarts etcd and the apiserver against
    the restored data.
-6. If encryption at rest is on, the restored data is still ciphertext — the
+6. Restore the PKI **before** starting the apiserver, from the `pki-<ts>.tar.gz`
+   matching the snapshot: `tar xzf pki-<ts>.tar.gz -C /etc/kubernetes`. Skipping
+   this is the difference between a cluster that comes back and one that holds
+   the right data while nothing can authenticate.
+7. If encryption at rest is on, the restored data is still ciphertext — the
    apiserver needs the same key from `inventory/vault/etcd_encryption.yml` to
    read it. Restoring onto a rebuilt control plane means running the encryption
    playbook with that vault file **before** expecting Secrets to be readable.
