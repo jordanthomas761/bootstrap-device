@@ -66,7 +66,7 @@ right after Cilium) via the official non-HA install manifest, pinned to
 `argocd_version` in `inventory/group_vars/control_plane/vars.yml`. This is
 imperative, like kube-vip and Cilium — ArgoCD can't manage its own initial
 install. Immediately after, the same task applies `homelab-infra`'s
-`root-app.yaml` (fetched from `homelab_infra_root_app_url`, its `main`
+`root-app.yaml` (rendered locally from the role's template, its `main`
 branch), which is the app-of-apps entry point — from that point on, ArgoCD
 syncs and self-heals everything under `homelab-infra`'s `apps/` on its own
 (Cilium, kube-vip, and ArgoCD itself stay imperative, since none of them can
@@ -573,6 +573,38 @@ For builds, configure the mirror on buildx instead, per workflow:
       [registry."docker.io"]
         mirrors = ["dockerhub-cache.jordanthomas.site"]
 ```
+
+## Argo CD Repository Access
+
+Argo CD clones `homelab-infra` over **SSH with a read-only deploy key**, not
+anonymously over https. That is what allows the repository to be private.
+
+Two things had to change for that, and both are easy to miss:
+
+- **The credential cannot live in the repository it unlocks.** Argo CD needs it
+  before it can read anything, so it is created here — by
+  `roles/k8s_control_plane/tasks/argocd.yml`, from
+  `inventory/vault/argocd_repo_key.yml`, **before** root-app is applied. Applied
+  the other way round, root-app lands, fails to clone, and the cluster sits in a
+  broken GitOps state.
+- **root-app.yaml is rendered locally**, not fetched from
+  `raw.githubusercontent.com`. That URL only resolves while the repository is
+  public, so fetching it would leave the bootstrap depending on exactly the
+  visibility the deploy key exists to remove.
+
+The Secret carries **two** labels and needs both:
+`argocd.argoproj.io/secret-type: repository` marks it as a repository
+credential, and `app.kubernetes.io/part-of: argocd` is what makes Argo CD's
+settings informer able to see it at all. Without the second, the Secret exists
+as far as `kubectl` is concerned while Argo CD behaves as though there is no
+credential — an authentication failure that looks like a bad key rather than a
+missing label.
+
+The key is **read-only on GitHub's side**, which matters: Argo CD only ever
+reads, and a writable key in the cluster would let anything able to read that
+Secret push to the repository defining the cluster. Losing it is recoverable —
+generate a new pair, replace the deploy key, re-run. Unlike the etcd encryption
+key, nothing is lost with it.
 
 ## What Gets Configured
 
