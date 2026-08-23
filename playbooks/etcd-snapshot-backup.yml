@@ -160,8 +160,9 @@
           {{ etcd_snapshot_stage_dir }}; timer runs
           {{ etcd_snapshot_on_calendar }}.
           {% if etcd_snapshot_remote_enabled %}
-          Shipping off-host to {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }}:{{ etcd_snapshot_remote_path }},
-          keeping {{ etcd_snapshot_keep_remote }} there.
+          Shipping off-host to
+          {{ etcd_snapshot_nfs_host }}:{{ etcd_snapshot_nfs_export }}/{{ etcd_snapshot_nfs_subdir }}
+          over NFS, keeping {{ etcd_snapshot_keep_remote }} there.
           {% else %}
           REMOTE SHIPPING IS OFF -- snapshots exist only on this control
           plane, which is the machine this is supposed to protect against

@@ -69,7 +69,7 @@ etcd_snapshot_keep_remote: 28
 # The playbook enables shipping only after it actually mounts this export and
 # writes to it -- see playbooks/etcd-snapshot-backup.yml.
 etcd_snapshot_nfs_host: nas.biwbass.xyz
-etcd_snapshot_nfs_export: /volume1/backups
+etcd_snapshot_nfs_export: /volume1/homelab-backups
 etcd_snapshot_nfs_subdir: etcd
 etcd_snapshot_nfs_mountpoint: /mnt/etcd-snapshots
 # hard so a copy blocks and retries rather than failing half-written if the NAS
