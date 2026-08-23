@@ -53,22 +53,46 @@
     replace: '\1bin_dir = "/opt/cni/bin"'
   notify: Restart containerd
 
+# Read the config_path that belongs to the CRI *registry* table specifically,
+# rather than trusting that the first config_path in the file is the right
+# one. The awk latches on the first table header ending in `.registry]` and
+# prints the next config_path under it, which lands on
+# io.containerd.grpc.v1.cri.registry (containerd 1.7) or
+# io.containerd.cri.v1.images.registry (2.x) without hardcoding either.
+- name: Read containerd's effective registry config_path
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      containerd config dump | awk '/\.registry\]$/ {f=1} f && /config_path/ {print; exit}'
+    executable: /bin/bash
+  register: k8s_common_containerd_registry_config_path
+  changed_when: false
+
+# Only rewrite when the registry's config_path is not already pointing at the
+# certs directory. This guard is what makes the regex below safe.
+#
+# Without it the task is actively wrong on containerd 2.x: Ubuntu's build
+# already ships
+#   [plugins.'io.containerd.cri.v1.images'.registry]
+#     config_path = '/etc/containerd/certs.d:/etc/docker/certs.d'
+# so there is nothing to do -- and the first EMPTY config_path in that file
+# belongs to [plugins.'io.containerd.transfer.v1.local'], an unrelated plugin
+# that the regex would have silently rewritten instead. Observed on the
+# control plane; the Debian 1.7 workers have no such key, which is why they
+# were fine.
 - name: Point containerd at the registry configuration directory
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.replace:
     path: /etc/containerd/config.toml
-    # Matches only the EMPTY value that `containerd config default` emits, which
-    # makes this idempotent for free: once rewritten the pattern no longer
-    # matches. Both quotings are accepted because the two containerd majors in
-    # this cluster disagree -- 1.7 on the Debian workers writes config_path = ""
-    # and 2.x on the Ubuntu control plane writes config_path = ''. The
-    # surrounding table name also moved between them
-    # (plugins."io.containerd.grpc.v1.cri".registry became
-    # plugins."io.containerd.cri.v1.images".registry), which is exactly why this
-    # anchors on the key rather than the section header.
+    # Matches only the EMPTY value that `containerd config default` emits, so
+    # it is idempotent. Both quotings are accepted because the two containerd
+    # majors disagree -- 1.7 writes "" and 2.x writes ''.
     regexp: "^(\\s*)config_path\\s*=\\s*(''|\"\")\\s*$"
     replace: '\1config_path = "{{ k8s_common_registry_certs_dir }}"'
+  when: k8s_common_registry_certs_dir not in k8s_common_containerd_registry_config_path.stdout
   notify: Restart containerd
 
 - name: Ensure containerd is enabled and running
