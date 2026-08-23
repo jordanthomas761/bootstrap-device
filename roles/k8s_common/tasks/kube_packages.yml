@@ -46,6 +46,14 @@
     src: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
     dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
     mode: "0644"
+  # The key change alone has to trigger the refresh. Only the repo task below
+  # notified this handler, which is fine on the run that first switches from
+  # trusted: true to signed_by -- the repo definition changes too, so it
+  # fires. It is not fine afterwards: on a run where the key rotates and the
+  # repo definition is already correct, nothing would notify, apt would keep
+  # serving the cached index, and the new key would go unexercised until some
+  # unrelated change happened to refresh it.
+  notify: Update Kubernetes apt cache
 
 # The deb822_repository task below owns the Kubernetes repo as
 # /etc/apt/sources.list.d/kubernetes.sources. An older one-line
