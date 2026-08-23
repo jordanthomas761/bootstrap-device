@@ -2,7 +2,22 @@
 kubernetes_series: "1.31"
 # Exact package version+revision pinned identically across control_plane and workers.
 # Find the right string with: apt-cache madison kubeadm  (after the kubernetes apt repo is added)
-kubernetes_package_version: "1.31.4-1.1"
+#
+# 1.31.14, not 1.31.4. These differ by ten patch releases and are easy to
+# misread. The nodes have been running 1.31.14-1.1 (apt-mark held); the pin
+# still said 1.31.4-1.1, so the install task resolved to a DOWNGRADE of
+# kubelet, kubeadm and kubectl on a live cluster. It failed safe only because
+# the hold blocked it:
+#
+#   The following packages will be DOWNGRADED: kubeadm kubectl kubelet
+#   E: Held packages were changed and -y was used without
+#      --allow-change-held-packages
+#
+# Do NOT "fix" that by adding --allow-change-held-packages or force: true.
+# The hold is the guard that stopped a live kubelet downgrade; the drifted pin
+# was the bug. Keep this value equal to what the nodes actually run, and check
+# with `apt-cache madison kubelet` before changing it.
+kubernetes_package_version: "1.31.14-1.1"
 # Derived for --kubernetes-version on kubeadm init/join — kept in sync with the pin above automatically.
 kubernetes_version: "v{{ kubernetes_package_version.split('-')[0] }}"
 
