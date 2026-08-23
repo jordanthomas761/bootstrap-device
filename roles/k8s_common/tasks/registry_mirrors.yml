@@ -77,6 +77,9 @@
     that:
       - k8s_common_registry_certs_dir in k8s_common_containerd_config_dump.stdout
       - k8s_common_empty_config_paths | length == 0
+      # Version-agnostic: the key is absent on containerd 1.7, so this passes
+      # there, and on 2.x it only passes once the pull path honours mirrors.
+      - "'use_local_image_pull = false' not in k8s_common_containerd_config_dump.stdout"
     fail_msg: >-
       containerd on {{ inventory_hostname }} is not fully pointed at
       {{ k8s_common_registry_certs_dir }}, so at least one component will
