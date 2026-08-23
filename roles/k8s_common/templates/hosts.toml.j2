@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+# Registry mirror configuration for {{ item.upstream }}.
+#
+# containerd tries every [host."..."] entry below IN ORDER, and only falls back
+# to `server` if they all fail. That ordering is the whole safety property of
+# this file: if the cache pod is down, its PVC is full, the gateway is
+# unhealthy, or internal DNS is not answering, pulls go straight to
+# {{ item.server }} and are merely slower. Nothing in the cluster
+# becomes unschedulable because a cache broke -- which also means a cold boot,
+# when the caches themselves have not started yet, still works.
+#
+# capabilities excludes "push" deliberately. These are read-only proxies and
+# cannot accept pushes; advertising the capability would make containerd try
+# and fail against them.
+#
+# Changes to this directory are re-read without restarting containerd.
+
+server = "{{ item.server }}"
+
+[host."{{ item.mirror }}"]
+  capabilities = ["pull", "resolve"]
