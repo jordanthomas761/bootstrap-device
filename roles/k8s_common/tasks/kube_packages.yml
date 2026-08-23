@@ -46,13 +46,41 @@
     dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
     mode: "0644"
 
+# The deb822_repository task below owns the Kubernetes repo as
+# /etc/apt/sources.list.d/kubernetes.sources. An older one-line
+# kubernetes.list may still be present from a previous bootstrap, and leaving
+# it alongside is not harmless:
+#
+#   - apt sees the same repo configured twice and warns on every run
+#   - that file pins signed-by to a .gpg keyring whose signature apt 3.x on
+#     trixie now rejects outright ("Signature Packet v3 is not considered
+#     secure since 2026-02-01"), because it verifies with sqv rather than
+#     gpgv
+#
+# Removing it makes the .sources file the single source of truth. Safe: the
+# packages it installed stay installed, and the repo it provided is the same
+# one, now declared correctly above.
+- name: Remove the superseded one-line Kubernetes apt source
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/kubernetes.list
+    state: absent
+  notify: Update Kubernetes apt cache
+
 - name: Add Kubernetes apt repository
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.deb822_repository:
     name: kubernetes
     types: deb
-    uris: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/"
+    # The "v" prefix is required and is NOT part of kubernetes_series, which
+    # is a bare "1.31" so it can also build the package version pin. Without
+    # it pkgs.k8s.io answers 403 Forbidden for Packages and InRelease --
+    # verified: core:/stable:/1.31/deb/Packages -> 403,
+    # core:/stable:/v1.31/deb/Packages -> 200. Both forms 302 on /Release,
+    # so a redirect check is not enough to catch this.
+    uris: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_series }}/deb/"
     suites: /
     # signed_by intentionally omitted (see TODO above) — trusted: true below
     # covers signature verification while the key fetch is disabled.
