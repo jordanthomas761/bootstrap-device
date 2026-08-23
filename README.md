@@ -188,6 +188,51 @@ protect against anyone who can reach the apiserver with cluster-admin — the
 apiserver holds the key and decrypts on read. It is a defence against offline
 access to the data, not against cluster access.
 
+## Longhorn Host Preparation
+
+Longhorn is deployed by GitOps from `homelab-infra` (`apps/longhorn`), but it
+depends on things that live below Kubernetes and cannot be expressed as a
+manifest. `playbooks/longhorn-prereqs.yml` does those:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/longhorn-prereqs.yml
+```
+
+Run it **before** syncing the Longhorn app. Skipping it does not produce a
+clear error — the CSI plugin starts happily and volumes simply never attach,
+which surfaces as pods stuck in `ContainerCreating` with nothing obvious in the
+logs. Safe to re-run; the only service it starts is `iscsid`, and it never
+touches the API server.
+
+What it does:
+
+- Installs `open-iscsi` (Longhorn attaches every volume as an iSCSI target on
+  the node) and `nfs-common` (needed for ReadWriteMany volumes and an NFS
+  backup target — neither in use yet, installed now so enabling either later
+  is not a second round of host changes).
+- Loads `iscsi_tcp` **and persists it** via `/etc/modules-load.d`. A node that
+  silently loses iSCSI across a reboot takes its Longhorn volumes with it.
+- Enables and starts `iscsid`.
+- **Blacklists Longhorn's devices from `multipathd`** where multipath-tools is
+  installed. multipathd claims those block devices out from under Longhorn; the
+  symptom is volumes failing to mount or mounting and then corrupting, with
+  errors about the device being busy. Only the control plane has the package
+  here, but a node that gains it later would otherwise break quietly.
+- Labels which nodes may host Longhorn disks.
+
+### Why the control plane holds no data
+
+`longhorn_storage_nodes` in `inventory/group_vars/all.yml` lists only the two
+Pis. The control plane has roughly 1 GB of available RAM and 19 GB of disk,
+against 400–860 GB of SSD on the Pis, so hosting replicas there would fill the
+disk and starve the API server. Longhorn's own components still run on it; only
+the storage is kept off.
+
+The node labels drive Longhorn's `createDefaultDiskLabeledNodes` setting. Nodes
+that should not hold data are labelled `false` rather than left unlabelled —
+both behave the same today, but the explicit value makes the intent legible to
+whoever later wonders why the control plane has no disk.
+
 ## What Gets Configured
 
 ### System Setup

@@ -1,0 +1,178 @@
+# Host preparation for Longhorn. Longhorn itself is deployed by GitOps from
+# homelab-infra (apps/longhorn); this playbook does the parts that live below
+# Kubernetes and cannot be expressed as a manifest.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/longhorn-prereqs.yml
+#
+# Run this BEFORE syncing the Longhorn app. Without it the CSI plugin comes up
+# and volumes simply never attach, which surfaces as pods stuck in
+# ContainerCreating with no obvious cause.
+#
+# Not in main.yml's chain: it is only needed on a cluster that actually runs
+# Longhorn, and it is safe to re-run at any time. No service restarts beyond
+# starting iscsid, and nothing here interrupts the API.
+- name: Prepare hosts for Longhorn
+  hosts: all
+
+  tasks:
+    # Refreshed as its own tolerated step rather than via the apt module's
+    # update_cache. This host set includes the pkgs.k8s.io repository, whose
+    # CDN intermittently answers 403, and update_cache treats any repo failing
+    # as fatal -- which would abort the play over a repository none of the
+    # packages below come from. A stale index still installs them fine.
+    - name: Refresh the apt cache, tolerating individual repo failures
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        update_cache: true
+        update_cache_retries: 1
+      # A partial refresh is fine and is reported by Ansible as a WARNING on
+      # its own, so there is nothing to add here -- and no result field to test
+      # reliably once failed_when has swallowed the failure.
+      changed_when: false
+      failed_when: false
+
+    # open-iscsi is the hard requirement: Longhorn attaches every volume as an
+    # iSCSI target on the node. nfs-common is needed for ReadWriteMany volumes
+    # and for an NFS backup target, neither of which is in use yet -- installed
+    # now so turning either on later is not a second round of host changes.
+    - name: Install the Longhorn host packages
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name:
+          - open-iscsi
+          - nfs-common
+        state: present
+        update_cache: false
+
+    - name: Ensure the iscsi_tcp module is loaded now
+      become: true
+      become_method: ansible.builtin.sudo
+      community.general.modprobe:
+        name: iscsi_tcp
+        state: present
+
+    # modprobe alone does not survive a reboot, and a node that silently loses
+    # iSCSI after a restart takes its Longhorn volumes with it.
+    - name: Ensure iscsi_tcp is loaded on every boot
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.copy:
+        content: |
+          # Managed by playbooks/longhorn-prereqs.yml
+          # Longhorn attaches volumes over iSCSI; without this the node comes
+          # back from a reboot unable to mount any Longhorn volume.
+          iscsi_tcp
+        dest: /etc/modules-load.d/longhorn-iscsi.conf
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable and start iscsid
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: iscsid
+        enabled: true
+        state: started
+
+    - name: Gather service facts to detect multipathd
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.service_facts:
+
+    # multipathd claims Longhorn's block devices out from under it. The symptom
+    # is ugly and non-obvious: volumes fail to mount, or mount and then corrupt,
+    # with errors about the device being busy. Longhorn's own docs call this out
+    # as the most common cause of broken volumes on Debian/Ubuntu, and only the
+    # control plane here has multipath-tools at all -- but blacklisting is
+    # cheap and a node that gains the package later would otherwise break
+    # quietly.
+    - name: Keep multipathd away from Longhorn devices
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.blockinfile:
+        path: /etc/multipath.conf
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+        marker: "# {mark} ANSIBLE MANAGED — longhorn"
+        block: |
+          blacklist {
+              devnode "^sd[a-z0-9]+"
+          }
+      when: "'multipathd.service' in ansible_facts.services"
+      notify: Restart multipathd
+
+    - name: Apply the multipath change before verifying
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify the host is ready for Longhorn
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: |
+        set -o pipefail
+        fail=0
+        lsmod | grep -q '^iscsi_tcp' || { echo "iscsi_tcp not loaded"; fail=1; }
+        systemctl is-active --quiet iscsid || { echo "iscsid not running"; fail=1; }
+        command -v iscsiadm >/dev/null || { echo "iscsiadm missing"; fail=1; }
+        command -v mount.nfs >/dev/null || { echo "mount.nfs missing"; fail=1; }
+        exit $fail
+      args:
+        executable: /bin/bash
+      register: longhorn_verify
+      changed_when: false
+      failed_when: longhorn_verify.rc != 0
+
+    - name: Report readiness
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is ready for Longhorn: iscsi_tcp loaded and
+          persisted, iscsid running, iscsiadm and mount.nfs present.
+
+  handlers:
+    - name: Restart multipathd
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: multipathd
+        state: restarted
+
+# Longhorn schedules storage only where it finds a labelled node. The control
+# plane is deliberately left out: it has ~1 GB of available RAM and 19 GB of
+# disk against 400-860 GB of SSD on the two Pis, so putting replicas there
+# would fill it and starve the API server. Labelling is done from the control
+# plane because it is the host with a kubeconfig.
+- name: Label the storage nodes for Longhorn
+  hosts: control_plane
+
+  tasks:
+    # One invocation rather than a loop: kubectl label accepts several node
+    # names, and inside a loop changed_when cannot see the registered result of
+    # the current iteration, so a looped version would misreport every run.
+    - name: Label nodes that should host Longhorn disks
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf label node
+        {{ longhorn_storage_nodes | join(' ') }}
+        node.longhorn.io/create-default-disk=true --overwrite
+      register: longhorn_label
+      changed_when: "'not labeled' not in longhorn_label.stdout"
+
+    # Explicitly false rather than merely absent: Longhorn's
+    # createDefaultDiskLabeledNodes setting only considers nodes carrying the
+    # label, so a node whose label is missing entirely and one set to false
+    # behave the same today -- but writing it makes the intent legible when
+    # someone later wonders why the control plane has no disk.
+    - name: Mark the remaining nodes as not hosting Longhorn disks
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf label node
+        {{ longhorn_non_storage_nodes | join(' ') }}
+        node.longhorn.io/create-default-disk=false --overwrite
+      register: longhorn_label_off
+      changed_when: "'not labeled' not in longhorn_label_off.stdout"

@@ -5,3 +5,13 @@ kubernetes_series: "1.31"
 kubernetes_package_version: "1.31.4-1.1"
 # Derived for --kubernetes-version on kubeadm init/join — kept in sync with the pin above automatically.
 kubernetes_version: "v{{ kubernetes_package_version.split('-')[0] }}"
+
+# Longhorn (see playbooks/longhorn-prereqs.yml). Storage is deliberately kept
+# off the control plane: it has ~1 GB available RAM and 19 GB of disk, against
+# 400-860 GB of SSD on the two Pis, so hosting replicas there would fill the
+# disk and starve the API server. Longhorn's own components still run there.
+longhorn_storage_nodes:
+  - pi5-gpio
+  - pi5-ml
+longhorn_non_storage_nodes:
+  - control-plane.k8s.internal
