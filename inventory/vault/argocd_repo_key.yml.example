@@ -1,0 +1,19 @@
+---
+# Template for inventory/vault/argocd_repo_key.yml. Copy, paste a real private
+# key, then ansible-vault encrypt it -- see the README.
+#
+# Generate the pair and register the PUBLIC half on the repository as a
+# READ-ONLY deploy key:
+#
+#     ssh-keygen -t ed25519 -N "" -f argocd_repo_key -C "argocd@homelab"
+#     gh api -X POST repos/<owner>/<repo>/keys \
+#       -f title="argocd-homelab (read-only)" \
+#       -f key="$(cat argocd_repo_key.pub)" -F read_only=true
+#
+# Read-only matters: Argo CD only ever reads. A writable key in the cluster
+# would let anything that can read this Secret push to the repository that
+# defines the cluster.
+vault_argocd_repo_ssh_key: |
+  -----BEGIN OPENSSH PRIVATE KEY-----
+  REPLACE-WITH-A-REAL-KEY
+  -----END OPENSSH PRIVATE KEY-----

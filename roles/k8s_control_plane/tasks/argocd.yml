@@ -101,13 +101,57 @@
 
 # The Application CRD is applied as part of install.yaml above but can take a
 # few seconds to become Established — retry rather than race it.
+# Argo CD needs the repository credential BEFORE root-app is applied. Applied
+# the other way round, root-app lands, immediately fails to clone, and the
+# cluster sits in a broken GitOps state until someone notices.
+- name: Install the Argo CD repository credential for homelab-infra
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.template:
+    src: argocd-repo-secret.yaml.j2
+    dest: /tmp/argocd-repo-secret.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  changed_when: false
+
+- name: Apply the repository credential
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    apply -n {{ argocd_namespace }} -f /tmp/argocd-repo-secret.yaml
+  register: k8s_control_plane_repo_secret
+  changed_when: k8s_control_plane_repo_secret.stdout is search('created|configured')
+
+# The rendered Secret holds the private key in cleartext; it has served its
+# purpose once applied.
+- name: Remove the rendered credential from disk
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.file:
+    path: /tmp/argocd-repo-secret.yaml
+    state: absent
+
+- name: Render root-app.yaml locally
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.template:
+    src: root-app.yaml.j2
+    dest: /tmp/root-app.yaml
+    owner: root
+    group: root
+    mode: "0644"
+  changed_when: false
+
 - name: Apply homelab-infra's root-app.yaml (hands the cluster to GitOps)
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.command: >
     kubectl --kubeconfig=/etc/kubernetes/admin.conf
     apply -n {{ argocd_namespace }}
-    -f {{ homelab_infra_root_app_url }}
+    -f /tmp/root-app.yaml
   register: k8s_control_plane_root_app_apply
   until: k8s_control_plane_root_app_apply.rc == 0
   retries: 12

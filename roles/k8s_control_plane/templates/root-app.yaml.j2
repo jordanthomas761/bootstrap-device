@@ -1,0 +1,33 @@
+# Managed by roles/k8s_control_plane/tasks/argocd.yml — do not hand-edit.
+#
+# Rendered locally rather than fetched from raw.githubusercontent.com, which
+# only resolves while homelab-infra is public. Fetching it would make the
+# bootstrap depend on the repository's visibility — the exact coupling the
+# deploy key exists to remove.
+#
+# Keep in step with root-app.yaml in homelab-infra.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-app
+  namespace: {{ argocd_namespace }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ homelab_infra_repo_url }}
+    targetRevision: HEAD
+    path: apps
+    directory:
+      recurse: true
+      include: "*/application.yaml"
+  destination:
+    name: in-cluster
+    namespace: {{ argocd_namespace }}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
