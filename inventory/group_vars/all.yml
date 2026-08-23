@@ -15,3 +15,59 @@ longhorn_storage_nodes:
   - pi5-ml
 longhorn_non_storage_nodes:
   - control-plane.k8s.internal
+
+# Kubelet resource reservations (see playbooks/kubelet-reservations.yml).
+#
+# All three nodes are ~8 GB / 4 cores, so one set of values applies everywhere.
+# Roughly 1 GB is held back from pods per node, plus a 500Mi eviction headroom:
+# about 1.5 GB of 8 GB, which is conservative for a node that has already
+# global-OOM'd once.
+#
+# The node's Kubernetes name is NOT the hostname on the workers — `uname -n`
+# gives gpio.k8s.internal while the node is registered as pi5-gpio. The
+# playbook derives it from the kubelet's client certificate CN instead, which
+# is the identity it actually authenticates as.
+
+kubelet_reservations:
+  # For everything outside Kubernetes: systemd, sshd, journald, the shell you
+  # are logged in on.
+  systemReserved:
+    cpu: 200m
+    memory: 512Mi
+    ephemeral-storage: 2Gi
+
+  # For Kubernetes' own node daemons — the kubelet and containerd. Measured at
+  # ~170 MB combined on this cluster; 512Mi leaves room for image pulls and log
+  # rotation spikes. Note static pods (kube-apiserver, etcd) do NOT come out of
+  # this: they are pods and are charged against the pod allocation.
+  kubeReserved:
+    cpu: 200m
+    memory: 512Mi
+    ephemeral-storage: 2Gi
+
+  # The point of the whole exercise. With no threshold set, a node under memory
+  # pressure has no way to shed load and the kernel OOM killer picks a victim
+  # arbitrarily — which is exactly how cilium-operator died. Below these, the
+  # kubelet evicts pods itself, in priority order.
+  evictionHard:
+    memory.available: "500Mi"
+    nodefs.available: "10%"
+    imagefs.available: "15%"
+
+  # A softer threshold that trips first and gives pods a grace period to
+  # terminate cleanly, instead of being killed outright at the hard limit.
+  # Every signal named here MUST also appear in evictionSoftGracePeriod or the
+  # kubelet refuses to start.
+  evictionSoft:
+    memory.available: "1Gi"
+    nodefs.available: "15%"
+  evictionSoftGracePeriod:
+    memory.available: "2m"
+    nodefs.available: "2m"
+  evictionMaxPodGracePeriod: 60
+
+  # Enforce the reservations against pods only. Enforcing against the system or
+  # kube cgroups as well would let the kubelet OOM-kill system daemons to stay
+  # inside its own budget, which is worse than the problem being solved.
+  enforceNodeAllocatable:
+    - pods

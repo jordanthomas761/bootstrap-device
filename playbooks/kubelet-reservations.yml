@@ -1,0 +1,190 @@
+# Reserves memory, CPU and disk for the OS and for Kubernetes' own daemons, so
+# the scheduler stops treating every byte on a node as available to pods.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/kubelet-reservations.yml
+#
+# WHY THIS EXISTS
+#
+# The control plane global-OOM'd and the kernel killed cilium-operator:
+#
+#   kubelet invoked oom-killer: ... global_oom
+#   Out of memory: Killed process 31452 (cilium-operator)
+#
+# constraint=CONSTRAINT_NONE means the whole node ran out of memory, not a
+# container exceeding its own limit. The cause was accounting, not capacity:
+# memory *requests* on that node totalled 410Mi while real usage was ~2.2GB, so
+# the scheduler believed the node was nearly empty. Nothing was reserved for
+# sshd, systemd, the kubelet or containerd, and no eviction thresholds were
+# set, so the node had no way to shed load — the kernel's OOM killer acted
+# instead, picking a victim arbitrarily.
+#
+# Reservations shrink allocatable so the scheduler stops overcommitting, and
+# eviction thresholds let the kubelet evict a pod *gracefully* before the
+# kernel kills one at random. More RAM alone does not fix this; it only moves
+# the cliff.
+#
+# Safe to run: restarting the kubelet does not stop running containers, and
+# static pods keep serving. The node may flick NotReady for a few seconds,
+# which is why this runs one host at a time.
+- name: Reserve node resources for the system and Kubernetes daemons
+  hosts: all
+  # One node at a time. Restarting every kubelet at once would take all three
+  # NotReady together, and on this cluster that includes the only control
+  # plane.
+  serial: 1
+
+  tasks:
+    # become, because /var/lib/kubelet/config.yaml is root-only on the workers
+    # and stat fails with a bare "Permission denied" without it.
+    - name: Assert this host is a joined Kubernetes node
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.stat:
+        path: /var/lib/kubelet/config.yaml
+      register: kubelet_reservations_config
+      failed_when: not kubelet_reservations_config.stat.exists
+
+    # Derived from the kubelet's own client certificate, not from the hostname.
+    # On the workers `uname -n` is the DNS name (gpio.k8s.internal) while the
+    # node is registered as pi5-gpio, so anything hostname-derived looks right
+    # on the control plane and silently misses on every worker. The certificate
+    # CN is the identity the kubelet actually authenticates as, so it always
+    # matches the Node object.
+    - name: Determine this node's Kubernetes name from the kubelet certificate
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: |
+        set -o pipefail
+        openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
+          -noout -subject |
+          grep -oE 'system:node:[^,/ ]+' | cut -d: -f3
+      args:
+        executable: /bin/bash
+      register: kubelet_reservations_cn
+      changed_when: false
+      failed_when: kubelet_reservations_cn.stdout | trim | length == 0
+
+    - name: Use the node name from the certificate
+      ansible.builtin.set_fact:
+        kubelet_reservations_node_name: "{{ kubelet_reservations_cn.stdout | trim }}"
+
+    # Pin the node's identity before anything restarts the kubelet.
+    #
+    # The kubelet defaults to `uname -n` for the name it registers under. Both
+    # workers here were joined as pi5-gpio / pi5-ml and had their hostnames
+    # changed afterwards (to gpio.k8s.internal and ml.k8s.interna), so a running
+    # kubelet kept the old identity while a restarted one would try to claim the
+    # new hostname -- and be rejected by the node authorizer, because its client
+    # certificate says otherwise:
+    #
+    #   leases.coordination.k8s.io "gpio.k8s.internal" is forbidden:
+    #   User "system:node:pi5-gpio" can only access node lease with the same
+    #   name as the requesting node
+    #
+    # The node then goes NotReady with "Kubelet stopped posting node status".
+    # This was latent for as long as the kubelets stayed up; the first restart
+    # for any reason -- this playbook, a package upgrade, a reboot -- triggers
+    # it. Set unconditionally, even where the hostname currently matches, so a
+    # future hostname change cannot reintroduce it.
+    - name: Pin the kubelet to the node name it was joined as
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by playbooks/kubelet-reservations.yml — do not hand-edit.
+          #
+          # The kubelet must register under the name it was joined as, which is
+          # the CN of its client certificate. Without this it uses the system
+          # hostname, and on a host renamed after joining the node authorizer
+          # rejects it.
+          KUBELET_EXTRA_ARGS=--hostname-override={{ kubelet_reservations_node_name }}
+      notify: Restart kubelet
+
+    - name: Install PyYAML for the config patcher
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: python3-yaml
+        state: present
+        update_cache: false
+
+    - name: Merge the reservations into the kubelet config
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.script: >
+        files/kubelet-reservations-patch.py
+        '{{ kubelet_reservations | to_json }}'
+      register: kubelet_reservations_patch
+      changed_when: kubelet_reservations_patch.rc == 2
+      failed_when: kubelet_reservations_patch.rc not in [0, 2]
+      notify: Restart kubelet
+
+    - name: Apply the change before checking the result
+      ansible.builtin.meta: flush_handlers
+
+    # `kubectl wait` rather than polling a jsonpath: a jsonpath filter needs
+    # embedded double quotes ({?(@.type=="Ready")}) and YAML folding strips
+    # them, leaving an expression kubectl rejects as an unrecognized
+    # identifier. wait --for=condition also blocks server-side instead of
+    # spinning in a retry loop.
+    #
+    # Checking the node object rather than systemd is deliberate: a kubelet can
+    # be "active" while failing to register, because a config it cannot parse
+    # makes it crash-loop and systemd reports the restarts as activity. Only
+    # the node reporting Ready proves it actually came back.
+    - name: Wait for this node to report Ready to the API
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf wait
+        --for=condition=Ready node/{{ kubelet_reservations_node_name }}
+        --timeout=180s
+      changed_when: false
+
+    # Fetched as JSON and parsed in Ansible for the same quoting reason.
+    - name: Read back what the node now reports
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node
+        {{ kubelet_reservations_node_name }} -o json
+      register: kubelet_reservations_node
+      changed_when: false
+
+    # Capacity is what the machine has; allocatable is what the scheduler may
+    # hand out. Before this playbook they were within ~100Mi of each other,
+    # which is the whole problem. Asserting they now differ meaningfully catches
+    # a patch that wrote settings the kubelet silently ignored.
+    - name: Assert the reservations actually took effect
+      vars:
+        node_status: "{{ (kubelet_reservations_node.stdout | from_json).status }}"
+        cap_mem: "{{ node_status.capacity.memory | regex_replace('Ki$', '') | int }}"
+        alloc_mem: "{{ node_status.allocatable.memory | regex_replace('Ki$', '') | int }}"
+      ansible.builtin.assert:
+        that:
+          - (cap_mem | int) - (alloc_mem | int) > 500000
+        fail_msg: >-
+          {{ kubelet_reservations_node_name }} reports capacity
+          {{ node_status.capacity.memory }} and allocatable
+          {{ node_status.allocatable.memory }} — barely different, so the
+          reservations did not take. Check `journalctl -u kubelet` for a
+          rejected config.
+        success_msg: >-
+          {{ kubelet_reservations_node_name }}: capacity
+          {{ node_status.capacity.memory }}, allocatable
+          {{ node_status.allocatable.memory }}, cpu allocatable
+          {{ node_status.allocatable.cpu }} — the difference is now held back
+          from the scheduler.
+        quiet: true
+
+  handlers:
+    - name: Restart kubelet
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: kubelet
+        state: restarted
