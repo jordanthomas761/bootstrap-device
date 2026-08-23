@@ -233,6 +233,69 @@ that should not hold data are labelled `false` rather than left unlabelled —
 both behave the same today, but the explicit value makes the intent legible to
 whoever later wonders why the control plane has no disk.
 
+## Kubelet Resource Reservations
+
+The control plane global-OOM'd and the kernel killed `cilium-operator`:
+
+```
+kubelet invoked oom-killer: ... global_oom
+Out of memory: Killed process 31452 (cilium-operator)
+```
+
+`constraint=CONSTRAINT_NONE` means the whole node ran out of memory, not a
+container exceeding its own limit. The cause was accounting, not capacity:
+memory *requests* on that node totalled 410Mi while real usage was ~2.2 GB, so
+the scheduler believed the node was nearly empty. Nothing was reserved for
+systemd, sshd, the kubelet or containerd, and no eviction thresholds were set,
+so the node had no way to shed load — the kernel's OOM killer acted instead and
+picked a victim arbitrarily.
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/kubelet-reservations.yml
+```
+
+Reservations shrink `allocatable` so the scheduler stops overcommitting, and
+eviction thresholds let the kubelet evict a pod *gracefully* before the kernel
+kills one at random. Adding RAM alone does not fix this — it only moves the
+cliff.
+
+Values live in `inventory/group_vars/all.yml`. All three nodes are ~8 GB / 4
+cores, so one set applies everywhere: roughly 1 GB held back plus a 500Mi hard
+eviction headroom. Afterwards each node reports allocatable about 1524Mi below
+capacity, and 3600m of CPU instead of 4.
+
+Runs one host at a time — restarting every kubelet at once would take all three
+NotReady together, and that includes the only control plane. Restarting a
+kubelet does not stop running containers.
+
+### The node-name trap
+
+The playbook pins each kubelet to the name it was joined as, via
+`--hostname-override` in `/etc/default/kubelet`, and this is **not** optional
+housekeeping.
+
+The kubelet defaults to `uname -n` for the name it registers under. Both
+workers here were joined as `pi5-gpio` / `pi5-ml`, then had their hostnames
+changed to `gpio.k8s.internal` and `ml.k8s.interna`. A *running* kubelet keeps
+its original identity, so nothing looked wrong for as long as they stayed up. A
+*restarted* one tries to claim the new hostname and is rejected by the node
+authorizer, because its client certificate says otherwise:
+
+```
+leases.coordination.k8s.io "gpio.k8s.internal" is forbidden:
+User "system:node:pi5-gpio" can only access node lease with the same name
+as the requesting node
+```
+
+The node then goes `NotReady` with *"Kubelet stopped posting node status"*. Any
+restart triggers it — this playbook, a package upgrade, a reboot. The override
+is set unconditionally, even where the hostname currently matches, so a future
+rename cannot reintroduce it.
+
+Note the correct name is read from the kubelet's client certificate CN, not
+from the hostname or the inventory — the certificate is the identity it
+actually authenticates as.
+
 ## What Gets Configured
 
 ### System Setup
