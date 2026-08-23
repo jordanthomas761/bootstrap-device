@@ -252,11 +252,36 @@ working when things are broken:
   keys. The difference between having a backup and having a file is whether
   anything ever checked.
 
-Remote shipping **enables itself only once the SSH key actually works**. If the
-key is not yet installed on the far end, the playbook says so loudly and prints
-the public key to install, rather than writing config that would leave a timer
-looking healthy in `systemctl list-timers` while every run silently failed to
-leave the host.
+Remote shipping goes over **NFS, not scp or rsync**. DSM only grants SSH to
+accounts in the `administrators` group, so an SSH-based copy would mean parking
+a key on the control plane that grants NAS admin — on the machine most exposed
+to the cluster, and the same NAS that serves the directory. An NFS export
+restricted to this host's IP needs no account and stores no credential at all.
+
+rsync was considered and rejected for this specific job: its advantage is delta
+transfer, and every snapshot is a new gzipped file with a fresh timestamped
+name, so there is nothing to diff against. It would still need a password in a
+secrets file, which is the thing NFS avoids.
+
+Shipping **enables itself only once the export demonstrably works** — the
+playbook mounts it and writes a probe file rather than merely checking the port
+answers, because "NFS is running" says nothing about whether this host is
+allowed in or the export is writable, and both fail silently at 06:00
+otherwise. Until it passes, the playbook says so loudly and reports the probe's
+exit code (10 = could not mount, 11/12 = mounted but not writable, usually the
+export's squash setting).
+
+### Setting up the export on the NAS
+
+In DSM: Control Panel → File Services → NFS → **Enable NFS service**. Then on
+the shared folder, Edit → NFS Permissions → Create:
+
+- **Hostname/IP**: the control plane's address only
+- **Privilege**: Read/Write
+- **Squash**: `No mapping`. This is the setting that catches people — the
+  default maps all users to guest, so the snapshot script runs as root and
+  cannot write, which surfaces as probe exit 11 or 12 rather than a mount
+  failure.
 
 Snapshots are ~3 MB gzipped, so frequency is cheap. Defaults: every 6 hours,
 3 kept locally as staging, 28 kept remotely (a week).
