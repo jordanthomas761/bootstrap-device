@@ -471,10 +471,38 @@ The nodes do not agree, and the role handles both:
 | control plane (Ubuntu 24.04) | 2.2.1 | `plugins.'io.containerd.cri.v1.images'.registry` |
 | `pi5-gpio`, `pi5-ml` (Debian trixie) | 1.7.24 | `plugins."io.containerd.grpc.v1.cri".registry` |
 
-The `hosts.toml` format is identical across both; only the stanza holding
-`config_path` moved, and the generated quoting differs (`""` on 1.7, `''` on
-2.x). The task anchors on the key rather than the section header and accepts
-either quoting.
+The `hosts.toml` format is identical across both. What differs is more than
+the stanza name and the quoting (`""` on 1.7, `''` on 2.x) — **on 2.x the
+registry table is not the key that governs mirroring at all**:
+
+```toml
+[plugins.'io.containerd.cri.v1.images']
+  use_local_image_pull = false        # pulls are DELEGATED to the transfer service
+
+[plugins.'io.containerd.cri.v1.images'.registry]
+  config_path = '/etc/containerd/certs.d:/etc/docker/certs.d'
+                                      # already correct out of the box —
+                                      # and unused for pulls while the above is false
+
+[plugins.'io.containerd.transfer.v1.local']
+  config_path = ''                    # ← the one that actually matters
+```
+
+Because `use_local_image_pull` defaults to `false`, the CRI plugin hands pulls
+to the transfer service, which reads its *own* `config_path`. Ubuntu ships the
+registry path already populated, so a check that looks only there reports
+everything healthy while every pull bypasses the cache.
+
+This was not theoretical. The control plane pulled a fresh image with the
+registry path correct, DNS resolving and HTTPS to the cache working — and the
+cache logged **zero** requests. It had been taking the upstream fallback
+silently.
+
+So the role populates *every* empty `config_path`. The value only ever means
+"where do I find registry `hosts.toml` files", so pointing whichever component
+performs the pull at the same directory is exactly the intent. The task is
+anchored on the `config_path` key exactly, so it cannot touch
+`plugin_config_path`, and matches empty values only, so it stays idempotent.
 
 Because that is a regex against a generated file, `registry_mirrors.yml` ends
 by running `containerd config dump` and asserting the path is actually in
