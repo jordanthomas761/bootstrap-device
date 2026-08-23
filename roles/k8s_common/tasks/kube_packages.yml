@@ -11,16 +11,19 @@
       - python3-debian
     state: present
 
+# Re-enabled. The "CDN block" these tasks were disabled for was never a block:
+# the URL was missing the "v" prefix and pkgs.k8s.io answered 403, exactly as
+# it did for the repo URI itself. Verified:
+#
+#   core:/stable:/1.31/deb/Release.key   -> 403
+#   core:/stable:/v1.31/deb/Release.key  -> 200 (1738 bytes, ASCII-armoured)
+#
+# Fetched once on the control node and copied out, rather than once per host.
 - name: Fetch Kubernetes apt signing key once
   delegate_to: localhost
   run_once: true
-  # TODO(temporary): still hitting the same pkgs.k8s.io CDN block even fetching
-  # once from the control node, so this (and the two tasks below) are disabled
-  # for now. trusted: true on the repo below makes apt skip signature
-  # verification instead. Re-enable once the CDN/WAF block is actually resolved.
-  when: false
   ansible.builtin.get_url:
-    url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_series }}/deb/Release.key"
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_series }}/deb/Release.key"
     dest: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
     mode: "0644"
   register: k8s_common_release_key_fetch
@@ -31,7 +34,6 @@
 - name: Ensure apt keyrings directory exists
   become: true
   become_method: ansible.builtin.sudo
-  when: false
   ansible.builtin.file:
     path: /etc/apt/keyrings
     state: directory
@@ -40,7 +42,6 @@
 - name: Install Kubernetes apt signing key
   become: true
   become_method: ansible.builtin.sudo
-  when: false
   ansible.builtin.copy:
     src: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
     dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
@@ -82,9 +83,19 @@
     # so a redirect check is not enough to catch this.
     uris: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_series }}/deb/"
     suites: /
-    # signed_by intentionally omitted (see TODO above) — trusted: true below
-    # covers signature verification while the key fetch is disabled.
-    trusted: true
+    # Verify against the key installed above rather than trusting the repo
+    # blindly. `trusted: true` was a workaround for the key fetch being
+    # disabled, and it does not merely relax a warning -- it disables
+    # signature verification for this repo entirely, so anything able to
+    # answer for the CDN could serve packages that install as root.
+    #
+    # It also masked a real failure: with the key absent, apt reported
+    # NO_PUBKEY 234654DA9A296436, kept using the stale index and exited 0 --
+    # but ansible.builtin.apt is stricter than apt-get and failed the play on
+    # the same condition, with an empty error message. That is the
+    # "Failed to update apt cache after 5 retries: " with nothing after the
+    # colon.
+    signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.asc
   notify: Update Kubernetes apt cache
 
 - name: Apply pending Kubernetes apt cache update
