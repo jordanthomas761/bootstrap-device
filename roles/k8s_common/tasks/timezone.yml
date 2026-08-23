@@ -1,0 +1,23 @@
+---
+# Every node on one timezone, and specifically on UTC.
+#
+# These nodes had drifted apart: the control plane ran UTC while both Pis ran
+# EDT. Nothing was broken by it, but correlating across nodes meant converting
+# in your head -- a kubelet log line read 03:34 on a Pi for an event the API
+# recorded at 09:34, which is a poor thing to be doing while debugging.
+#
+# UTC rather than Eastern, because host-local time only ever agrees with half
+# the system. Containers do not inherit the host timezone unless it is mounted
+# in, so every pod on this cluster logs UTC regardless -- Longhorn's manager,
+# which evaluates its backup cron, included. Putting the hosts on Eastern would
+# swap a host-vs-host mismatch for a host-vs-pod one, which is harder to spot.
+#
+# Note systemd evaluates OnCalendar in the system timezone, so changing this
+# silently reschedules any timer on the host. The etcd snapshot timer runs only
+# on the control plane, which is already UTC, so this changes nothing there --
+# but it is the reason to think before setting a node to local time.
+- name: Set the node timezone
+  become: true
+  become_method: ansible.builtin.sudo
+  community.general.timezone:
+    name: "{{ node_timezone }}"

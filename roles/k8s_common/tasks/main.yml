@@ -21,6 +21,9 @@
 - name: Ensure time sync is enabled
   ansible.builtin.import_tasks: time_sync.yml
 
+- name: Standardise the node timezone
+  ansible.builtin.import_tasks: timezone.yml
+
 - name: Ensure port 10250 is free for kubelet
   ansible.builtin.import_tasks: port_10250.yml
 

@@ -75,3 +75,12 @@ kubelet_reservations:
   # inside its own budget, which is worse than the problem being solved.
   enforceNodeAllocatable:
     - pods
+
+# Timezone for every cluster node (roles/k8s_common/tasks/timezone.yml).
+#
+# UTC on purpose. Containers do not inherit the host timezone unless it is
+# mounted in, so every pod here logs UTC regardless -- including Longhorn's
+# manager, which evaluates the volume-backup cron. Putting the hosts on Eastern
+# would trade a host-vs-host mismatch for a host-vs-pod one, which is harder to
+# notice.
+node_timezone: Etc/UTC
