@@ -93,6 +93,10 @@
     regexp: "^(\\s*)config_path\\s*=\\s*(''|\"\")\\s*$"
     replace: '\1config_path = "{{ k8s_common_registry_certs_dir }}"'
   notify: Restart containerd
+  # Part of the registry-mirrors tag: without this task the hosts.toml files
+  # are written but never read, so a tagged run has to include it.
+  tags:
+    - registry-mirrors
 
 - name: Ensure containerd is enabled and running
   become: true

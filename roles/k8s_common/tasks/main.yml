@@ -59,8 +59,20 @@
 - name: Install and configure containerd
   ansible.builtin.import_tasks: containerd.yml
 
+# Tagged so the mirrors can be applied on their own:
+#
+#   ansible-playbook main.yml -i inventory/hosts.yml \
+#     --limit <host> --tags registry-mirrors
+#
+# Worth having because a full run of this role touches swap, kernel modules,
+# sysctl, apt sources, kubeadm packages and the ArgoCD install on a live
+# cluster, none of which a mirror config change needs. The tag covers this
+# import and the config_path task in containerd.yml, which together are the
+# complete set.
 - name: Configure registry pull-through caches
   ansible.builtin.import_tasks: registry_mirrors.yml
+  tags:
+    - registry-mirrors
 
 - name: Install kubeadm, kubelet, and kubectl
   ansible.builtin.import_tasks: kube_packages.yml
