@@ -483,8 +483,10 @@ matching would be invisible — pulls would still succeed, just never cached.
 
 ### Verifying
 
+Use `crictl`, **not** `ctr`:
+
 ```bash
-sudo ctr --namespace k8s.io images pull docker.io/library/alpine:3.20
+sudo crictl pull docker.io/library/busybox:1.36
 ```
 
 Then check the cache logged it, from a machine with cluster access:
@@ -492,6 +494,36 @@ Then check the cache logged it, from a machine with cluster access:
 ```bash
 kubectl -n registry-cache logs deploy/dockerhub --tail=20
 ```
+
+A hit looks like this — note the User-Agent, which is containerd on the node
+rather than a browser or curl, and the `?ns=docker.io` namespace hint that
+containerd appends when it is talking to a mirror:
+
+```
+"HEAD /v2/library/busybox/manifests/1.36?ns=docker.io" 200 0 "" "containerd/1.7.24~ds1"
+```
+
+### Why crictl and not ctr
+
+`ctr` does **not** read `/etc/containerd/certs.d`. It is a low-level debug
+client that bypasses the CRI plugin, and the mirror configuration belongs to
+that plugin — so a plain `ctr images pull` goes straight to the upstream
+registry and the cache logs nothing.
+
+That makes it precisely the wrong tool for this check: the pull succeeds, the
+cache looks idle, and the obvious conclusion is that the mirrors are broken
+when they are fine. Verified on this cluster — same image, same node, one
+command through each path:
+
+| command | cache hit |
+|---|---|
+| `ctr images pull ...` | **no** |
+| `ctr images pull --hosts-dir /etc/containerd/certs.d ...` | yes |
+| `crictl pull ...` | yes |
+
+`crictl` is the right check because it goes through the CRI plugin, which is
+the same path the kubelet uses — so it tests what actually matters. Reach for
+`ctr` only with an explicit `--hosts-dir`.
 
 ### Known gap: dind runners
 
