@@ -1,0 +1,32 @@
+---
+# Pull-through caches for the public registries this cluster pulls from. The
+# backing Deployments live in the homelab-infra repo under
+# apps/registry-cache/; these entries only tell containerd they exist.
+#
+# `upstream` is the directory name under certs.d and must be the registry host
+# exactly as it appears in an image reference -- so `docker.io`, NOT
+# `registry-1.docker.io`. containerd looks up certs.d/<that host>/hosts.toml
+# using the reference's host, and a directory named after the endpoint instead
+# is simply never consulted. This is the single easiest thing to get wrong
+# here, and it fails silently: pulls keep working, they just never touch the
+# cache.
+#
+# `server` is the fallback containerd uses when the mirror does not answer, and
+# for docker.io that IS the registry-1 endpoint.
+k8s_common_registry_mirrors:
+  - upstream: docker.io
+    server: https://registry-1.docker.io
+    mirror: https://dockerhub-cache.jordanthomas.site
+  - upstream: ghcr.io
+    server: https://ghcr.io
+    mirror: https://ghcr-cache.jordanthomas.site
+  - upstream: quay.io
+    server: https://quay.io
+    mirror: https://quay-cache.jordanthomas.site
+  - upstream: registry.k8s.io
+    server: https://registry.k8s.io
+    mirror: https://k8s-cache.jordanthomas.site
+
+# Where containerd looks for per-registry host configuration. Referenced from
+# containerd.yml, which writes this value into config.toml's `config_path`.
+k8s_common_registry_certs_dir: /etc/containerd/certs.d

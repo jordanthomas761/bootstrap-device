@@ -53,6 +53,24 @@
     replace: '\1bin_dir = "/opt/cni/bin"'
   notify: Restart containerd
 
+- name: Point containerd at the registry configuration directory
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    # Matches only the EMPTY value that `containerd config default` emits, which
+    # makes this idempotent for free: once rewritten the pattern no longer
+    # matches. Both quotings are accepted because the two containerd majors in
+    # this cluster disagree -- 1.7 on the Debian workers writes config_path = ""
+    # and 2.x on the Ubuntu control plane writes config_path = ''. The
+    # surrounding table name also moved between them
+    # (plugins."io.containerd.grpc.v1.cri".registry became
+    # plugins."io.containerd.cri.v1.images".registry), which is exactly why this
+    # anchors on the key rather than the section header.
+    regexp: "^(\\s*)config_path\\s*=\\s*(''|\"\")\\s*$"
+    replace: '\1config_path = "{{ k8s_common_registry_certs_dir }}"'
+  notify: Restart containerd
+
 - name: Ensure containerd is enabled and running
   become: true
   become_method: ansible.builtin.sudo

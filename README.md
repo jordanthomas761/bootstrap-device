@@ -402,6 +402,118 @@ Note the correct name is read from the kubelet's client certificate CN, not
 from the hostname or the inventory — the certificate is the identity it
 actually authenticates as.
 
+## Container Registry Mirrors
+
+Points containerd on every node at the in-cluster pull-through caches, so image
+pulls are served from the LAN instead of re-fetched from Docker Hub, ghcr.io,
+quay.io and registry.k8s.io each time. The caches themselves are Kubernetes
+workloads managed in the `homelab-infra` repo under `apps/registry-cache/`;
+this repo only configures the client side.
+
+Applied by the `k8s_common` role (`tasks/registry_mirrors.yml`), so it runs as
+part of the normal `main.yml` — no separate playbook.
+
+| Upstream | Mirror |
+|---|---|
+| `docker.io` | `dockerhub-cache.jordanthomas.site` |
+| `ghcr.io` | `ghcr-cache.jordanthomas.site` |
+| `quay.io` | `quay-cache.jordanthomas.site` |
+| `registry.k8s.io` | `k8s-cache.jordanthomas.site` |
+
+The mapping lives in `roles/k8s_common/defaults/main.yml` as
+`k8s_common_registry_mirrors` and can be overridden per host or group.
+
+### How it works
+
+Two pieces have to line up:
+
+1. `config.toml` must set `config_path = "/etc/containerd/certs.d"`. This is
+   done in `tasks/containerd.yml` by rewriting the empty value that
+   `containerd config default` emits.
+2. Each mirrored registry gets
+   `/etc/containerd/certs.d/<upstream>/hosts.toml`.
+
+The directory name must be the registry host **as it appears in an image
+reference** — `docker.io`, not `registry-1.docker.io`. A directory named after
+the endpoint is simply never consulted, and it fails silently: pulls keep
+working, they just never hit the cache.
+
+Files under `certs.d/` are re-read on every pull, so changing a mirror needs no
+containerd restart. Changing `config_path` does, and that task notifies the
+`Restart containerd` handler.
+
+### The fallback is the point
+
+Each `hosts.toml` names the upstream as `server` and the cache as a `[host]`
+entry. containerd tries `[host]` entries first and falls back to `server`:
+
+```toml
+server = "https://registry-1.docker.io"
+
+[host."https://dockerhub-cache.jordanthomas.site"]
+  capabilities = ["pull", "resolve"]
+```
+
+So a cache that is down, full, or unreachable because internal DNS is not
+answering degrades pulls to their normal speed rather than making pods
+unschedulable. It is also what lets a cold boot work at all, since the caches
+cannot serve their own images before they are running.
+
+`push` is deliberately absent from `capabilities` — these are read-only
+proxies.
+
+### Two containerd majors
+
+The nodes do not agree, and the role handles both:
+
+| Node | containerd | Registry stanza |
+|---|---|---|
+| control plane (Ubuntu 24.04) | 2.2.1 | `plugins.'io.containerd.cri.v1.images'.registry` |
+| `pi5-gpio`, `pi5-ml` (Debian trixie) | 1.7.24 | `plugins."io.containerd.grpc.v1.cri".registry` |
+
+The `hosts.toml` format is identical across both; only the stanza holding
+`config_path` moved, and the generated quoting differs (`""` on 1.7, `''` on
+2.x). The task anchors on the key rather than the section header and accepts
+either quoting.
+
+Because that is a regex against a generated file, `registry_mirrors.yml` ends
+by running `containerd config dump` and asserting the path is actually in
+containerd's resolved configuration. Without that check a regex that stopped
+matching would be invisible — pulls would still succeed, just never cached.
+
+### Verifying
+
+```bash
+sudo ctr --namespace k8s.io images pull docker.io/library/alpine:3.20
+```
+
+Then check the cache logged it, from a machine with cluster access:
+
+```bash
+kubectl -n registry-cache logs deploy/dockerhub --tail=20
+```
+
+### Known gap: dind runners
+
+The ARC runners run Docker-in-Docker, and the inner `dockerd` does **not** use
+containerd's mirrors — it has its own registry configuration. The
+`gha-runner-scale-set` chart hardcodes that container (fixed image, args and
+mounts, and its `non-runner-non-dind-containers` helper filters out any
+user-supplied container named `dind`), so there is no values hook to add a
+`--registry-mirror`.
+
+Node-level pulls — including the runner and dind images themselves — are still
+cached. Only `docker pull` / `docker build` *inside* a job bypasses the cache.
+For builds, configure the mirror on buildx instead, per workflow:
+
+```yaml
+- uses: docker/setup-buildx-action@v3
+  with:
+    buildkitd-config-inline: |
+      [registry."docker.io"]
+        mirrors = ["dockerhub-cache.jordanthomas.site"]
+```
+
 ## What Gets Configured
 
 ### System Setup
@@ -414,6 +526,10 @@ actually authenticates as.
 
 ### Development Environment
 - Oh-My-ZSH shell framework (control plane + workers)
+
+### Container Runtime
+- containerd registry mirrors pointing at the in-cluster pull-through caches
+  (control plane + workers) — see [Container Registry Mirrors](#container-registry-mirrors)
 
 ## Dependencies
 
@@ -435,7 +551,7 @@ actually authenticates as.
 │   ├── host_vars/                # per-worker vars (e.g. ML workload labeling)
 │   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded; gitignored by default, encrypted files committed with git add -f)
 ├── roles/
-│   ├── k8s_common/                # swap, kernel modules, containerd, kubeadm/kubelet/kubectl
+│   ├── k8s_common/                # swap, kernel modules, containerd, registry mirrors, kubeadm/kubelet/kubectl
 │   ├── k8s_control_plane/         # kube-vip, kubeadm init, Cilium CNI, ArgoCD install + server.insecure
 │   └── k8s_worker/                # kubeadm join
 ├── files/
