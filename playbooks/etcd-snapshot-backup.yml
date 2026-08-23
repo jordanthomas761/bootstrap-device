@@ -1,0 +1,187 @@
+# Installs a systemd timer that takes verified etcd snapshots and ships them
+# off the control plane.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/etcd-snapshot-backup.yml
+#
+# This is the availability half of protecting etcd. playbooks/etcd-encryption-
+# at-rest.yml handles confidentiality — it stops a stolen snapshot being
+# readable — but encryption does nothing for losing the machine. Without
+# snapshots, losing this single control plane loses all cluster state whether
+# or not the encryption key survived.
+#
+# Unlike the encryption playbook this one is safe and boring to run: it writes
+# a script, a service and a timer, and never touches the apiserver manifest.
+# No API outage.
+#
+# Snapshots are taken through crictl rather than kubectl, so they keep working
+# when the apiserver does not — see the comments in the script template.
+- name: Install periodic verified etcd snapshots
+  hosts: control_plane
+
+  tasks:
+    - name: Assert this host is an initialized control plane
+      ansible.builtin.stat:
+        path: /etc/kubernetes/manifests/etcd.yaml
+      register: etcd_snapshot_etcd_manifest
+      failed_when: not etcd_snapshot_etcd_manifest.stat.exists
+
+    - name: Create the snapshot staging directory
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.file:
+        path: "{{ etcd_snapshot_stage_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # Generated here, not by hand, so the private half never leaves the control
+    # plane. Ansible cannot install the public half on the Synology -- that
+    # needs a NAS login -- so the playbook prints it and stops short of
+    # enabling remote shipping until the key actually works.
+    # ssh-keygen with creates: rather than community.crypto.openssh_keypair --
+    # that collection is not in requirements.yml and pulling in a dependency for
+    # one keypair is not worth it. creates: makes this generate-once: a re-run
+    # must never mint a new key, or the public half already installed on the
+    # NAS would stop matching and shipping would break silently.
+    - name: Generate a dedicated SSH key for shipping snapshots, once
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        ssh-keygen -t ed25519 -N "" -f {{ etcd_snapshot_ssh_key }}
+        -C "etcd-snapshot-backup@{{ inventory_hostname }}"
+      args:
+        creates: "{{ etcd_snapshot_ssh_key }}"
+
+    - name: Read the public key back
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.slurp:
+        src: "{{ etcd_snapshot_ssh_key }}.pub"
+      register: etcd_snapshot_pubkey
+
+    - name: Check whether the snapshot host is already reachable with that key
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        ssh -i {{ etcd_snapshot_ssh_key }}
+        -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+        {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }} true
+      register: etcd_snapshot_ssh_probe
+      changed_when: false
+      failed_when: false
+
+    # Remote shipping turns itself on only once the key demonstrably works.
+    # Writing the config as if it worked would produce a timer that looks
+    # healthy in `systemctl list-timers` while every run fails to leave the
+    # host -- the exact failure mode a backup must not have.
+    - name: Decide whether remote shipping can be enabled
+      ansible.builtin.set_fact:
+        etcd_snapshot_remote_enabled: "{{ etcd_snapshot_ssh_probe.rc == 0 }}"
+
+    - name: Install the snapshot script
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.template:
+        src: etcd-snapshot.sh.j2
+        dest: "{{ etcd_snapshot_script }}"
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the systemd service
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.template:
+        src: etcd-snapshot.service.j2
+        dest: /etc/systemd/system/etcd-snapshot.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Install the systemd timer
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.template:
+        src: etcd-snapshot.timer.j2
+        dest: /etc/systemd/system/etcd-snapshot.timer
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+    - name: Reload systemd now, before enabling the timer
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start the timer
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: etcd-snapshot.timer
+        enabled: true
+        state: started
+
+    # Running it once here is the point of the whole playbook: an untested
+    # backup is a guess. This proves the script can reach etcd, that the
+    # snapshot verifies, and -- when remote shipping is on -- that it lands on
+    # the far end.
+    # state: started on a Type=oneshot unit runs it and waits for it to finish,
+    # which is what makes the assertion below meaningful.
+    - name: Take one snapshot now to prove the whole path works
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: etcd-snapshot.service
+        state: started
+
+    - name: Collect the result of that run
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: journalctl -u etcd-snapshot.service -n 30 --no-pager
+      register: etcd_snapshot_run_log
+      changed_when: false
+
+    - name: Assert the snapshot was taken and verified
+      ansible.builtin.assert:
+        that:
+          - "'verified: revision=' in etcd_snapshot_run_log.stdout"
+          - "'ERROR' not in etcd_snapshot_run_log.stdout"
+        fail_msg: >-
+          The snapshot run did not verify. Full log:
+          {{ etcd_snapshot_run_log.stdout }}
+        success_msg: Snapshot taken and verified.
+        quiet: true
+
+    - name: List what is staged locally
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.find:
+        paths: "{{ etcd_snapshot_stage_dir }}"
+        patterns: "etcd-*.db.gz"
+      register: etcd_snapshot_staged
+
+    - name: Report where things stand
+      ansible.builtin.debug:
+        msg: >-
+          {{ etcd_snapshot_staged.files | length }} snapshot(s) staged in
+          {{ etcd_snapshot_stage_dir }}; timer runs
+          {{ etcd_snapshot_on_calendar }}.
+          {% if etcd_snapshot_remote_enabled %}
+          Shipping off-host to {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }}:{{ etcd_snapshot_remote_path }},
+          keeping {{ etcd_snapshot_keep_remote }} there.
+          {% else %}
+          REMOTE SHIPPING IS OFF -- snapshots exist only on this control plane,
+          which is the machine this is supposed to protect against losing. To
+          turn it on, add this public key to
+          {{ etcd_snapshot_remote_user }}@{{ etcd_snapshot_remote_host }} and
+          re-run this playbook:
+          {{ etcd_snapshot_pubkey.content | b64decode | trim }}
+          {% endif %}
+
+  handlers:
+    - name: Reload systemd
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        daemon_reload: true

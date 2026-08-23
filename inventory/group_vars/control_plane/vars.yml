@@ -47,3 +47,23 @@ etcd_encryption_key_name: key1
 etcd_encryption_resources:
   - secrets
 etcd_encryption_canary_name: etcd-encryption-canary
+
+# Periodic verified etcd snapshots (see playbooks/etcd-snapshot-backup.yml).
+# This is the availability half of protecting etcd; the encryption playbook
+# covers confidentiality. Encryption does nothing for losing the machine.
+etcd_snapshot_stage_dir: /var/backups/etcd
+etcd_snapshot_script: /usr/local/sbin/etcd-snapshot.sh
+etcd_snapshot_ssh_key: /root/.ssh/id_ed25519_etcd_snapshot
+# systemd OnCalendar. Every 6h: etcd is ~15 MiB after a defrag, so frequency is
+# cheap, and 6h bounds how much cluster state a restore would roll back.
+etcd_snapshot_on_calendar: "*-*-* 00,06,12,18:00:00"
+# Local is a staging area on the machine being protected against, so keep few.
+# The off-host copy is the actual backup, so keep a useful history there:
+# 28 x 6h is a week.
+etcd_snapshot_keep_local: 3
+etcd_snapshot_keep_remote: 28
+# Where snapshots are shipped. The playbook enables shipping only once this
+# host is actually reachable with etcd_snapshot_ssh_key — see the playbook.
+etcd_snapshot_remote_user: "{{ nas_backup_user | default('backup') }}"
+etcd_snapshot_remote_host: nas.biwbass.xyz
+etcd_snapshot_remote_path: "{{ nas_backup_path | default('/volume1/backups/etcd') }}"
