@@ -11,8 +11,8 @@ kubernetes_version: "v{{ kubernetes_package_version.split('-')[0] }}"
 # 400-860 GB of SSD on the two Pis, so hosting replicas there would fill the
 # disk and starve the API server. Longhorn's own components still run there.
 longhorn_storage_nodes:
-  - pi5-gpio
-  - pi5-ml
+  - gpio.k8s.internal
+  - ml.k8s.internal
 longhorn_non_storage_nodes:
   - control-plane.k8s.internal
 
@@ -23,10 +23,14 @@ longhorn_non_storage_nodes:
 # about 1.5 GB of 8 GB, which is conservative for a node that has already
 # global-OOM'd once.
 #
-# The node's Kubernetes name is NOT the hostname on the workers — `uname -n`
-# gives gpio.k8s.internal while the node is registered as pi5-gpio. The
-# playbook derives it from the kubelet's client certificate CN instead, which
-# is the identity it actually authenticates as.
+# Node names and hostnames now agree on every host — the workers were re-joined
+# as gpio.k8s.internal / ml.k8s.internal on 2026-08-23, having previously been
+# registered as pi5-gpio / pi5-ml under changed hostnames.
+#
+# The playbook still derives the name from the kubelet's client certificate CN
+# rather than trusting the hostname, and still writes --hostname-override
+# unconditionally. That is deliberate: it is what makes a future rename a
+# non-event instead of a node that goes NotReady on its next kubelet restart.
 
 kubelet_reservations:
   # For everything outside Kubernetes: systemd, sshd, journald, the shell you
