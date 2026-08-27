@@ -1,0 +1,671 @@
+# One-minor-version Kubernetes upgrade for this kubeadm cluster.
+#
+# WHY THIS EXISTS
+#
+# The cluster drifted a long way behind: the nodes were pinned at v1.31 while
+# upstream had moved on by five minors. kubeadm refuses to skip a minor, so
+# closing that gap is not one upgrade, it is a sequence of them
+# (1.31 -> 1.32 -> 1.33 -> ...), each with the same fiddly, order-sensitive
+# dance of packages, drains and kubelet restarts. Doing that by hand five times
+# on a live single-control-plane cluster is how mistakes happen. This playbook
+# is that dance, once, done the same way every time.
+#
+# HOW TO USE IT — ONE HOP AT A TIME
+#
+#   1. Confirm the CNI (Cilium), kube-vip and any operators support the target
+#      Kubernetes minor. This playbook does NOT check that — see
+#      "COMPATIBILITY IS NOT CHECKED HERE" below.
+#   2. Bump BOTH pins in inventory/group_vars/all.yml to the NEXT minor only:
+#        kubernetes_series:          "1.32"
+#        kubernetes_package_version: "1.32.9-1.1"   # apt-cache madison kubeadm
+#   3. ansible-playbook -i inventory/hosts.yml playbooks/kubernetes-upgrade.yml
+#   4. Repeat from step 1 for the minor after that.
+#
+# The preflight play asserts the new series is exactly one minor above what the
+# API server currently reports and stops otherwise, so a two-minor jump in the
+# pins fails fast rather than halfway through.
+#
+# WHAT IT DOES, IN ORDER
+#
+#   preflight   assert single hop, every node Ready and on the current
+#               version, the target packages resolvable from apt; take a
+#               pre-upgrade etcd snapshot.
+#   apt repo    re-point /etc/apt/sources.list.d/kubernetes.sources at the new
+#               minor's pkgs.k8s.io repo on every node (no installs yet).
+#   control     install the new kubeadm, `kubeadm upgrade apply`, drain the
+#               node, upgrade kubelet + kubectl, restart the kubelet, uncordon.
+#   workers     one at a time: install the new kubeadm, `kubeadm upgrade node`,
+#               drain from the control plane, upgrade kubelet + kubectl,
+#               restart the kubelet, uncordon.
+#   verify      every node Ready and reporting the target version; kube-system
+#               rollouts complete.
+#
+# SINGLE CONTROL PLANE
+#
+# `kubeadm upgrade apply` restarts the static control-plane pods and etcd on
+# the one control-plane node, so the API server is briefly unavailable
+# mid-run. Workloads keep running; kubectl and GitOps reconciliation pause for
+# a minute or two. There is no way around this without a second control-plane
+# node.
+#
+# COMPATIBILITY IS NOT CHECKED HERE
+#
+# Cilium and kube-vip are pinned in
+# inventory/group_vars/control_plane/vars.yml and upgraded separately (Cilium
+# via `cilium upgrade` / GitOps, kube-vip by re-templating its static pod).
+# Every Kubernetes minor has a supported Cilium range; running a Cilium that
+# predates the target Kubernetes is how the CNI breaks after an upgrade. Check
+# the Cilium release notes and bump `cilium_version` FIRST if needed. The
+# preflight play prints the current pins as a reminder but cannot validate
+# them.
+#
+# LONGHORN AND DRAINING THE WORKERS
+#
+# The Pi workers run Longhorn, which puts PodDisruptionBudgets on its
+# instance-manager pods to protect the last healthy replica of a volume. If a
+# worker drain blocks on one, the drain task times out. Make sure every volume
+# is healthy (Longhorn UI, "Volume" tab) before running, or scale the noisy
+# workloads down first. `k8s_upgrade_drain_timeout` and
+# `k8s_upgrade_drain_extra_args` are there if you need to tune it.
+#
+# SAFE TO RE-RUN
+#
+# Every step is guarded on the version actually observed, so a run that fails
+# on a worker can be re-run and picks up where it stopped. It will not
+# re-apply an upgrade that is already in place.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/kubernetes-upgrade.yml
+
+- name: Preflight — validate this is a single safe hop
+  hosts: control_plane
+  gather_facts: false
+
+  vars:
+    # Set true only if you have an etcd backup by some other means and the
+    # snapshot helper (playbooks/etcd-snapshot-backup.yml) is not installed.
+    k8s_upgrade_skip_snapshot: false
+
+  tasks:
+    # Fetched here, in the single-host preflight play, so a CDN 403 fails the
+    # run before anything is touched — and so the repo-repoint play below can
+    # just copy it out without a run_once dance. pkgs.k8s.io is a per-minor
+    # repo whose CDN intermittently 403s, hence the retries.
+    - name: Fetch the Kubernetes apt signing key for the target minor
+      delegate_to: localhost
+      become: false
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_series }}/deb/Release.key"
+        dest: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
+        mode: "0644"
+      register: k8s_upgrade_release_key
+      until: k8s_upgrade_release_key is succeeded
+      retries: 5
+      delay: 15
+
+    - name: Read the version the API server reports
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf version -o json
+      register: k8s_upgrade_version_raw
+      changed_when: false
+
+    - name: Work out the current and target minors
+      ansible.builtin.set_fact:
+        k8s_upgrade_server_version: "{{ (k8s_upgrade_version_raw.stdout | from_json).serverVersion.gitVersion }}"
+        k8s_upgrade_current_minor: >-
+          {{ (k8s_upgrade_version_raw.stdout | from_json).serverVersion.gitVersion
+             | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2') }}
+        k8s_upgrade_target_minor: "{{ kubernetes_series }}"
+        k8s_upgrade_target_version: "{{ kubernetes_version }}"
+
+    - name: Assert the two version pins agree on the minor
+      ansible.builtin.assert:
+        that:
+          - kubernetes_version | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2') == kubernetes_series
+        fail_msg: >-
+          kubernetes_package_version ({{ kubernetes_package_version }}) and
+          kubernetes_series ({{ kubernetes_series }}) disagree on the minor
+          version. Bump both together in inventory/group_vars/all.yml.
+        quiet: true
+
+    # Full gitVersion, not just the minor: this is what decides whether
+    # `kubeadm upgrade apply` still has to run. On a fresh hop the server is a
+    # minor behind; on a re-run after the control plane is done it already
+    # equals the target exactly.
+    - name: Record whether the control plane is already on the target version
+      ansible.builtin.set_fact:
+        k8s_upgrade_cp_done: "{{ k8s_upgrade_server_version == k8s_upgrade_target_version }}"
+
+    - name: Assert this is a single forward minor hop
+      vars:
+        _cur_major: "{{ k8s_upgrade_current_minor.split('.')[0] | int }}"
+        _cur_min: "{{ k8s_upgrade_current_minor.split('.')[1] | int }}"
+        _tgt_major: "{{ k8s_upgrade_target_minor.split('.')[0] | int }}"
+        _tgt_min: "{{ k8s_upgrade_target_minor.split('.')[1] | int }}"
+      ansible.builtin.assert:
+        that:
+          - _tgt_major | int == _cur_major | int
+          # Fresh hop: target is exactly one minor ahead of the API server.
+          # Re-run: control plane already on the target, finishing the workers.
+          - >-
+            (not (k8s_upgrade_cp_done | bool) and (_tgt_min | int) == (_cur_min | int) + 1)
+            or
+            (k8s_upgrade_cp_done | bool and (_tgt_min | int) == (_cur_min | int))
+        fail_msg: >-
+          This playbook moves one minor forward at a time (e.g. 1.31 -> 1.32).
+          The API server is on {{ k8s_upgrade_server_version }} and the pins
+          target {{ k8s_upgrade_target_version }}. For a normal hop set
+          kubernetes_series to {{ _cur_major }}.{{ (_cur_min | int) + 1 }} with
+          a matching kubernetes_package_version. Patch-only bumps within a
+          series are not handled here.
+        success_msg: >-
+          {{ k8s_upgrade_server_version }} -> {{ k8s_upgrade_target_version }}:
+          {{ 'resuming — control plane already done' if k8s_upgrade_cp_done | bool
+             else 'one minor hop' }}.
+        quiet: true
+
+    - name: Assert every node is Ready
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+        --for=condition=Ready nodes --all --timeout=30s
+      changed_when: false
+
+    # custom-columns, not jsonpath: a `?(@.type=="Ready")` filter needs
+    # embedded double quotes and YAML folding strips them. Readiness is already
+    # asserted above with `kubectl wait`, so all that is needed here is the
+    # version string per node.
+    - name: Read every node's kubelet version
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers
+        -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion
+      register: k8s_upgrade_node_versions
+      changed_when: false
+
+    - name: Reduce that to the set of minors present in the cluster
+      ansible.builtin.set_fact:
+        k8s_upgrade_minors_present: >-
+          {{ k8s_upgrade_node_versions.stdout_lines
+             | map('split') | map('last')
+             | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')
+             | unique | list }}
+
+    - name: Stop if there is nothing left to upgrade
+      ansible.builtin.assert:
+        that:
+          # If the control plane is done, at least one node must still be
+          # behind — otherwise the whole cluster is already on the target and
+          # the pins just were not bumped for the next hop.
+          - not (k8s_upgrade_cp_done | bool) or (k8s_upgrade_minors_present | length) > 1
+        fail_msg: >-
+          Every node is already on {{ kubernetes_series }}. Nothing to do —
+          bump kubernetes_series and kubernetes_package_version to the next
+          minor for the following hop.
+        quiet: true
+
+    - name: Look for the etcd snapshot helper
+      ansible.builtin.stat:
+        path: "{{ etcd_snapshot_script }}"
+      register: k8s_upgrade_snapshot_script
+
+    - name: Take a pre-upgrade etcd snapshot
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: "{{ etcd_snapshot_script }}"
+      register: k8s_upgrade_snapshot
+      changed_when: true
+      when: k8s_upgrade_snapshot_script.stat.exists
+
+    - name: Show where the snapshot landed
+      ansible.builtin.debug:
+        var: k8s_upgrade_snapshot.stdout_lines
+      when: k8s_upgrade_snapshot_script.stat.exists
+
+    - name: Refuse to continue without a snapshot mechanism
+      ansible.builtin.fail:
+        msg: >-
+          {{ etcd_snapshot_script }} is not installed, so no pre-upgrade etcd
+          snapshot was taken. Run playbooks/etcd-snapshot-backup.yml first, or
+          re-run with -e k8s_upgrade_skip_snapshot=true if you have a backup by
+          other means.
+      when:
+        - not k8s_upgrade_snapshot_script.stat.exists
+        - not (k8s_upgrade_skip_snapshot | bool)
+
+    - name: Upgrade plan
+      ansible.builtin.debug:
+        msg:
+          - "cluster now:      {{ k8s_upgrade_server_version }}"
+          - "upgrading to:     {{ k8s_upgrade_target_version }}"
+          - "kubeadm apply:    {{ 'not needed, already done' if k8s_upgrade_cp_done | bool else 'yes' }}"
+          - "nodes:            {{ k8s_upgrade_node_versions.stdout_lines | map('trim') | list }}"
+          - "cilium pin:       {{ cilium_version }}  <- confirm this supports {{ k8s_upgrade_target_version }}"
+          - "kube-vip pin:     {{ kube_vip_version }}"
+
+- name: Re-point the Kubernetes apt repository at the target minor
+  hosts: control_plane:workers
+  gather_facts: false
+
+  tasks:
+    # The key was fetched to the control node in the preflight play; copy it
+    # out to every node from there (ansible.builtin.copy reads src from the
+    # controller), same as roles/k8s_common does.
+    - name: Install the signing key
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.copy:
+        src: "/tmp/kubernetes-{{ kubernetes_series }}-release.key"
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+
+    - name: Point the repo at v{{ kubernetes_series }}
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.deb822_repository:
+        name: kubernetes
+        types: deb
+        uris: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_series }}/deb/"
+        suites: /
+        signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+      register: k8s_upgrade_repo
+
+    - name: Refresh apt, tolerating unrelated repo failures
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        update_cache: true
+        update_cache_retries: 3
+        update_cache_retry_max_delay: 20
+      changed_when: false
+      # The authoritative check is the per-node "kubeadm is available" assert
+      # below; a partial refresh here (another repo down) must not abort the
+      # play before that runs.
+      failed_when: false
+
+    - name: Assert the target kubeadm is now installable
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: apt-cache madison kubeadm
+      register: k8s_upgrade_madison
+      changed_when: false
+      failed_when: kubernetes_package_version not in k8s_upgrade_madison.stdout
+
+- name: Upgrade the control plane
+  hosts: control_plane
+  gather_facts: true
+
+  handlers:
+    - name: Restart kubelet
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: kubelet
+        daemon_reload: true
+        state: restarted
+
+  tasks:
+    # The node's Kubernetes name is the CN of its kubelet client certificate,
+    # not `uname -n` — see the note in playbooks/kubelet-reservations.yml. Used
+    # for drain / uncordon / wait below.
+    - name: Determine this node's Kubernetes name from the kubelet certificate
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: |
+        set -o pipefail
+        openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
+          -noout -subject |
+          grep -oE 'system:node:[^,/ ]+' | cut -d: -f3
+      args:
+        executable: /bin/bash
+      register: k8s_upgrade_cp_cn
+      changed_when: false
+      failed_when: k8s_upgrade_cp_cn.stdout | trim | length == 0
+
+    - name: Use the node name from the certificate
+      ansible.builtin.set_fact:
+        k8s_upgrade_cp_node: "{{ k8s_upgrade_cp_cn.stdout | trim }}"
+
+    - name: Unhold kubeadm
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: install
+
+    - name: Install the target kubeadm
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: "kubeadm={{ kubernetes_package_version }}"
+        state: present
+        allow_downgrade: false
+        update_cache: false
+
+    - name: Hold kubeadm again
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: hold
+
+    - name: Ask kubeadm what it will change
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: kubeadm upgrade plan {{ kubernetes_version }}
+      register: k8s_upgrade_plan
+      changed_when: false
+      when: not (hostvars[inventory_hostname].k8s_upgrade_cp_done | bool)
+
+    - name: Show the kubeadm upgrade plan
+      ansible.builtin.debug:
+        var: k8s_upgrade_plan.stdout_lines
+      when: not (hostvars[inventory_hostname].k8s_upgrade_cp_done | bool)
+
+    # async, not because of a deadlock (that is kubeadm init's problem) but
+    # because this restarts the API server and etcd under itself and can run
+    # for several minutes; a backgrounded job survives an SSH hiccup that a
+    # synchronous one would not.
+    - name: Run kubeadm upgrade apply {{ kubernetes_version }}
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: kubeadm upgrade apply -y {{ kubernetes_version }}
+      async: 1200
+      poll: 15
+      register: k8s_upgrade_apply
+      when: not (hostvars[inventory_hostname].k8s_upgrade_cp_done | bool)
+      changed_when: true
+
+    - name: Cordon and drain {{ k8s_upgrade_cp_node }}
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf drain {{ k8s_upgrade_cp_node }}
+        --ignore-daemonsets --delete-emptydir-data --force
+        --timeout={{ k8s_upgrade_drain_timeout | default('300s') }}
+        {{ k8s_upgrade_drain_extra_args | default('') }}
+      register: k8s_upgrade_cp_drain
+      changed_when: true
+      retries: 3
+      delay: 15
+      until: k8s_upgrade_cp_drain.rc == 0
+
+    - name: Unhold kubelet and kubectl
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Install the target kubelet and kubectl
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ kubernetes_package_version }}"
+          - "kubectl={{ kubernetes_package_version }}"
+        state: present
+        allow_downgrade: false
+        update_cache: false
+      notify: Restart kubelet
+
+    - name: Hold kubelet and kubectl again
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Restart the kubelet before going on
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the upgraded control-plane node to report Ready
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+        --for=condition=Ready node/{{ k8s_upgrade_cp_node }} --timeout=180s
+      register: k8s_upgrade_cp_ready
+      changed_when: false
+      retries: 5
+      delay: 15
+      until: k8s_upgrade_cp_ready.rc == 0
+
+    - name: Uncordon {{ k8s_upgrade_cp_node }}
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ k8s_upgrade_cp_node }}
+      changed_when: true
+
+- name: Upgrade the workers
+  hosts: workers
+  gather_facts: true
+  # One at a time. Two Pis draining at once would move every replica of a
+  # Longhorn volume, and a kubelet restart flicks the node NotReady.
+  serial: 1
+
+  handlers:
+    - name: Restart kubelet
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: kubelet
+        daemon_reload: true
+        state: restarted
+
+  tasks:
+    - name: Determine this node's Kubernetes name from the kubelet certificate
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: |
+        set -o pipefail
+        openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
+          -noout -subject |
+          grep -oE 'system:node:[^,/ ]+' | cut -d: -f3
+      args:
+        executable: /bin/bash
+      register: k8s_upgrade_wk_cn
+      changed_when: false
+      failed_when: k8s_upgrade_wk_cn.stdout | trim | length == 0
+
+    - name: Use the node name from the certificate
+      ansible.builtin.set_fact:
+        k8s_upgrade_wk_node: "{{ k8s_upgrade_wk_cn.stdout | trim }}"
+
+    - name: Read this node's current kubelet version from the API
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get node {{ k8s_upgrade_wk_node }}
+        --no-headers -o custom-columns=V:.status.nodeInfo.kubeletVersion
+      register: k8s_upgrade_wk_ver
+      changed_when: false
+
+    - name: Decide whether this node still needs the upgrade
+      ansible.builtin.set_fact:
+        k8s_upgrade_wk_needed: >-
+          {{ (k8s_upgrade_wk_ver.stdout | trim
+              | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')) != kubernetes_series }}
+
+    - name: Report a worker that is already done
+      ansible.builtin.debug:
+        msg: "{{ k8s_upgrade_wk_node }} is already on {{ k8s_upgrade_wk_ver.stdout | trim }} — skipping."
+      when: not (k8s_upgrade_wk_needed | bool)
+
+    - name: Upgrade {{ k8s_upgrade_wk_node }}
+      when: k8s_upgrade_wk_needed | bool
+      block:
+        - name: Unhold kubeadm
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.dpkg_selections:
+            name: kubeadm
+            selection: install
+
+        - name: Install the target kubeadm
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.apt:
+            name: "kubeadm={{ kubernetes_package_version }}"
+            state: present
+            allow_downgrade: false
+            update_cache: false
+
+        - name: Hold kubeadm again
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.dpkg_selections:
+            name: kubeadm
+            selection: hold
+
+        - name: Run kubeadm upgrade node
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: kubeadm upgrade node
+          changed_when: true
+
+        - name: Cordon and drain this worker from the control plane
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: >
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf drain {{ k8s_upgrade_wk_node }}
+            --ignore-daemonsets --delete-emptydir-data --force
+            --timeout={{ k8s_upgrade_drain_timeout | default('300s') }}
+            {{ k8s_upgrade_drain_extra_args | default('') }}
+          register: k8s_upgrade_wk_drain
+          changed_when: true
+          retries: 3
+          delay: 15
+          until: k8s_upgrade_wk_drain.rc == 0
+
+        - name: Unhold kubelet and kubectl
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop:
+            - kubelet
+            - kubectl
+
+        - name: Install the target kubelet and kubectl
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.apt:
+            name:
+              - "kubelet={{ kubernetes_package_version }}"
+              - "kubectl={{ kubernetes_package_version }}"
+            state: present
+            allow_downgrade: false
+            update_cache: false
+          notify: Restart kubelet
+
+        - name: Hold kubelet and kubectl again
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubectl
+
+        - name: Restart the kubelet before going on
+          ansible.builtin.meta: flush_handlers
+
+        - name: Wait for the upgraded worker to report Ready
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: >
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+            --for=condition=Ready node/{{ k8s_upgrade_wk_node }} --timeout=180s
+          register: k8s_upgrade_wk_ready
+          changed_when: false
+          retries: 5
+          delay: 15
+          until: k8s_upgrade_wk_ready.rc == 0
+
+      always:
+        # Never leave a node cordoned, even if the block failed after the drain.
+        - name: Uncordon {{ k8s_upgrade_wk_node }}
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.command: >
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ k8s_upgrade_wk_node }}
+          changed_when: true
+          when: k8s_upgrade_wk_needed | bool
+
+- name: Verify the upgrade
+  hosts: control_plane
+  gather_facts: false
+
+  tasks:
+    - name: Wait for every node to be Ready
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+        --for=condition=Ready nodes --all --timeout=120s
+      changed_when: false
+
+    - name: Read back every node's version
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers
+        -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion
+      register: k8s_upgrade_final_versions
+      changed_when: false
+
+    - name: Assert the whole cluster is on the target version
+      ansible.builtin.assert:
+        that:
+          - >-
+            k8s_upgrade_final_versions.stdout_lines
+            | map('split') | map('last')
+            | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')
+            | unique | list == [kubernetes_series]
+        fail_msg: >-
+          Nodes are still on a mix of versions:
+          {{ k8s_upgrade_final_versions.stdout_lines | map('trim') | list }}
+        success_msg: >-
+          Every node is on {{ kubernetes_series }}:
+          {{ k8s_upgrade_final_versions.stdout_lines | map('trim') | list }}
+        quiet: true
+
+    - name: Wait for kube-system workloads to roll out
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: |
+        set -euo pipefail
+        K="kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system"
+        for w in $($K get deploy,daemonset -o name); do
+          $K rollout status "$w" --timeout=180s
+        done
+      args:
+        executable: /bin/bash
+      register: k8s_upgrade_rollout
+      changed_when: false
+
+    - name: Done — what to do next
+      ansible.builtin.debug:
+        msg:
+          - "{{ k8s_upgrade_rollout.stdout_lines }}"
+          - ""
+          - "This hop is complete. For the next minor:"
+          - "  1. Check Cilium ({{ cilium_version }}) and kube-vip ({{ kube_vip_version }}) support it."
+          - "  2. Bump kubernetes_series + kubernetes_package_version in inventory/group_vars/all.yml."
+          - "  3. Run this playbook again."

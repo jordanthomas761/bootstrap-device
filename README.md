@@ -402,6 +402,60 @@ Note the correct name is read from the kubelet's client certificate CN, not
 from the hostname or the inventory — the certificate is the identity it
 actually authenticates as.
 
+## Kubernetes Version Upgrades
+
+The cluster fell a long way behind — pinned at v1.31 while upstream had moved
+on five minors. kubeadm refuses to skip a minor, so closing that gap is a
+*sequence* of upgrades (1.31 → 1.32 → 1.33 → …), each the same order-sensitive
+dance of packages, drains and kubelet restarts.
+`playbooks/kubernetes-upgrade.yml` is that dance, done the same way every time.
+
+```bash
+# One minor per run:
+#  1. confirm Cilium / kube-vip support the target minor
+#  2. bump BOTH pins in inventory/group_vars/all.yml to the next minor only:
+#        kubernetes_series:          "1.32"
+#        kubernetes_package_version: "1.32.9-1.1"   # apt-cache madison kubeadm
+ansible-playbook -i inventory/hosts.yml playbooks/kubernetes-upgrade.yml
+#  3. repeat for the minor after that
+```
+
+The preflight play asserts the new series is exactly one minor above what the
+API server reports and stops otherwise, so a two-minor jump in the pins fails
+fast instead of halfway through. It also takes a pre-upgrade etcd snapshot
+(via the helper from `etcd-snapshot-backup.yml`) and refuses to run if that
+helper is not installed.
+
+Order per run: `kubeadm upgrade apply` on the control plane, then
+`kubeadm upgrade node` on each worker one at a time, with a cordon/drain and a
+kubelet restart around every node. Every step is guarded on the version
+actually observed, so a run that fails on a worker can be re-run and resumes
+where it stopped.
+
+### Two things it does not do
+
+- **Compatibility checks.** Cilium (`cilium_version`) and kube-vip
+  (`kube_vip_version`) are pinned in
+  `inventory/group_vars/control_plane/vars.yml` and upgraded separately. Each
+  Kubernetes minor has a supported Cilium range; running a Cilium that
+  predates the target Kubernetes is how the CNI breaks after an upgrade. Check
+  the release notes and bump `cilium_version` *first* if needed — the playbook
+  prints the current pins but cannot validate them.
+- **Avoid an API outage.** With a single control-plane node,
+  `kubeadm upgrade apply` restarts the static control-plane pods and etcd
+  under itself, so the API server is briefly unavailable mid-run. Workloads
+  keep running; `kubectl` and Argo CD reconciliation pause for a minute or
+  two.
+
+### Draining the Pi workers
+
+The workers run Longhorn, which puts PodDisruptionBudgets on its
+instance-manager pods to protect the last healthy replica of a volume. If a
+worker drain blocks on one, the drain task times out. Make sure every volume
+is healthy in the Longhorn UI before running, or scale the noisy workloads
+down first. `k8s_upgrade_drain_timeout` (default `300s`) and
+`k8s_upgrade_drain_extra_args` are the knobs if you need them.
+
 ## Container Registry Mirrors
 
 Points containerd on every node at the in-cluster pull-through caches, so image
@@ -657,6 +711,7 @@ key, nothing is lost with it.
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)
     ├── etcd-snapshot-backup.yml  # Installs the verified-snapshot systemd timer (safe to run, no API outage)
+    ├── kubernetes-upgrade.yml    # One-minor kubeadm upgrade: apply, drain, kubelet, uncordon, verify (brief API outage; run per minor)
     ├── build-autoinstall-iso.yml # Ubuntu autoinstall seed ISO for the control-plane VM
     ├── files/                    # kube-apiserver manifest patcher used by the encryption playbook
     └── templates/                # user-data / meta-data / EncryptionConfiguration templates
