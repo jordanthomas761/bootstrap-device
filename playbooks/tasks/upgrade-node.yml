@@ -163,8 +163,14 @@
     # the other; draining the second before Longhorn has rebuilt the first's
     # replicas means the drain waits ~10 min on the last-healthy-replica PDB
     # while the rebuild it needs runs off the node being drained. Gate each
-    # drain on Longhorn being whole again first. No-op where Longhorn isn't
-    # installed, or on a cluster without it.
+    # drain on no volume being degraded first. No-op where Longhorn isn't
+    # installed.
+    #
+    # "degraded" (attached, missing a replica) is the state a drain must not
+    # race. "healthy" is fine; so is "unknown"/"" on a *detached* volume — an
+    # idle or scaled-down workload holds no replica the drain could strand, and
+    # such a volume never reports "healthy", so waiting for it would just burn
+    # the retry budget.
     - name: Check whether Longhorn is installed
       delegate_to: "{{ upgrade_node_kubectl_host }}"
       become: true
@@ -175,18 +181,19 @@
       changed_when: false
       failed_when: false
 
-    - name: Wait for every Longhorn volume to be healthy before draining
+    - name: Wait until no Longhorn volume is degraded before draining
       delegate_to: "{{ upgrade_node_kubectl_host }}"
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.command: >
         kubectl --kubeconfig=/etc/kubernetes/admin.conf -n longhorn-system
-        get volumes.longhorn.io -o custom-columns=R:.status.robustness --no-headers
+        get volumes.longhorn.io
+        -o custom-columns=S:.status.state,R:.status.robustness --no-headers
       register: _upgrade_node_lh_vols
       changed_when: false
       until: >-
-        _upgrade_node_lh_vols.stdout_lines | map('trim')
-        | reject('eq', 'healthy') | list | length == 0
+        _upgrade_node_lh_vols.stdout_lines
+        | select('search', '\bdegraded\b') | list | length == 0
       retries: 40
       delay: 15
       when: _upgrade_node_longhorn.rc == 0
