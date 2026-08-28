@@ -127,10 +127,22 @@
         name: etcd-snapshot.service
         state: started
 
+    # Only this run's journal, not the unit's history -- otherwise an earlier
+    # failed attempt still sitting in the last 30 lines fails the assert even
+    # though the run we just triggered succeeded.
+    - name: Read this run's InvocationID
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: etcd-snapshot.service
+      register: etcd_snapshot_unit
+
     - name: Collect the result of that run
       become: true
       become_method: ansible.builtin.sudo
-      ansible.builtin.command: journalctl -u etcd-snapshot.service -n 30 --no-pager
+      ansible.builtin.command: >
+        journalctl _SYSTEMD_INVOCATION_ID={{ etcd_snapshot_unit.status.InvocationID }}
+        --no-pager
       register: etcd_snapshot_run_log
       changed_when: false
 
@@ -140,7 +152,7 @@
           - "'verified: revision=' in etcd_snapshot_run_log.stdout"
           - "'ERROR' not in etcd_snapshot_run_log.stdout"
         fail_msg: >-
-          The snapshot run did not verify. Full log:
+          The snapshot run did not verify. This run's log:
           {{ etcd_snapshot_run_log.stdout }}
         success_msg: Snapshot taken and verified.
         quiet: true

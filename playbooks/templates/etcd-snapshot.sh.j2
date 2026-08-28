@@ -28,8 +28,15 @@ CERTS="--cacert=/etc/kubernetes/pki/etcd/ca.crt \
 log() { echo "[etcd-snapshot] $*"; }
 die() { echo "[etcd-snapshot] ERROR: $*" >&2; exit 1; }
 
-CID="$(crictl ps --name etcd -q 2>/dev/null | head -1)"
-[ -n "$CID" ] || die "no running etcd container found via crictl"
+# Select kubeadm's etcd by its pod labels, not `--name etcd` -- that also
+# matches the `etcd` container in external-dns's etcd-dns-* pod, and when that
+# lands on the control plane `head -1` can pick it instead. Its container has
+# no /etc/kubernetes/pki/etcd mount, so the snapshot then fails with
+# "open /etc/kubernetes/pki/etcd/server.crt: no such file or directory".
+CID="$(crictl ps -q --state Running \
+  --label io.kubernetes.pod.namespace=kube-system \
+  --label io.kubernetes.container.name=etcd 2>/dev/null | head -1)"
+[ -n "$CID" ] || die "no running kube-system etcd container found via crictl"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 NAME="etcd-${TS}.db"
