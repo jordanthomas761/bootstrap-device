@@ -1,0 +1,201 @@
+# Serves MLX inference from the Apple-Silicon Mac (pi.dev) as a launchd daemon,
+# replacing the hand-run `mlx_lm.server`.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/mlx-inference.yml \
+#     -e mlx_model_path=mlx-community/Qwen3-30B-A3B-Instruct-2507-8bit
+#
+# WHY THIS EXISTS
+#
+# `mlx_lm.server` picks its tool-call parser by sniffing the chat template, and
+# it does not recognise the non-Coder Qwen 3 templates (ml-explore/mlx-lm#1293).
+# The model still emits a tool call, but the server leaves it in
+# `choices[].message.content` as raw text instead of parsing it into a
+# structured `tool_calls` array — so anything downstream that dispatches on
+# `tool_calls` sees nothing and the call silently never runs.
+#
+# mlx-openai-server takes an explicit `--tool-call-parser`, so the parse no
+# longer depends on template detection. This playbook:
+#   1. installs it into its own uv-managed virtualenv under a single prefix,
+#   2. runs it from a launchd daemon so it survives a crash and a reboot
+#      instead of living in a terminal,
+#   3. proves the fix with a real tool-call request before it finishes.
+#
+# NOT in main.yml: pi.dev is the only macOS host in the fleet, it is not always
+# online, and it is not a Kubernetes node. Run this on demand, like the other
+# non-main playbooks (etcd, longhorn, upgrade).
+#
+# STILL MANUAL (tracked in the issue, not automatable from here):
+#   - OPNsense perimeter check: `pfctl -sr` on the firewall, confirm nothing
+#     permits bridge0 -> ixl0 (should already be covered by the
+#     Kubernetes-LAN <-> Personal-LAN default-deny).
+#   - Shared-secret header on the server: deferred. Access is currently scoped
+#     cluster-side by NetworkPolicy in homelab-infra.
+- name: Serve MLX inference from a launchd daemon
+  hosts: inference
+  become_method: ansible.builtin.sudo
+
+  tasks:
+    - name: Assert this host is an Apple-Silicon Mac
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Darwin"
+          - ansible_facts.architecture == "arm64"
+        fail_msg: >-
+          playbooks/mlx-inference.yml only targets Apple-Silicon macOS;
+          {{ inventory_hostname }} reports
+          {{ ansible_facts.system }} / {{ ansible_facts.architecture }}.
+
+    - name: Require an explicit model path
+      ansible.builtin.assert:
+        that:
+          - mlx_model_path is defined
+          - (mlx_model_path | default('') | trim) | length > 0
+        fail_msg: >-
+          Set mlx_model_path — in inventory/group_vars/inference.yml or with
+          `-e mlx_model_path=...` — to the MLX model this host should serve.
+          There is deliberately no default.
+
+    - name: Ensure uv is installed
+      become: false
+      community.general.homebrew:
+        name: uv
+        state: present
+        path: /opt/homebrew/bin
+
+    - name: Create the install prefix and its subdirectories
+      become: true
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ mlx_server_user }}"
+        group: staff
+        mode: "0755"
+      loop:
+        - "{{ mlx_server_prefix }}"
+        - "{{ mlx_server_prefix }}/logs"
+        - "{{ mlx_hf_home }}"
+
+    - name: Create the mlx-openai-server virtualenv
+      become: true
+      become_user: "{{ mlx_server_user }}"
+      ansible.builtin.command:
+        cmd: >-
+          {{ mlx_uv_bin }} venv --python {{ mlx_python_version }}
+          {{ mlx_server_prefix }}/venv
+        creates: "{{ mlx_server_prefix }}/venv/bin/python"
+
+    - name: Install and pin mlx-openai-server
+      become: true
+      become_user: "{{ mlx_server_user }}"
+      ansible.builtin.command:
+        cmd: >-
+          {{ mlx_uv_bin }} pip install
+          --python {{ mlx_server_prefix }}/venv/bin/python
+          mlx-openai-server=={{ mlx_openai_server_version }}
+      register: mlx_install
+      changed_when: >-
+        '+ mlx-openai-server==' in (mlx_install.stdout + mlx_install.stderr)
+
+    - name: Install the launchd daemon definition
+      become: true
+      ansible.builtin.template:
+        src: mlx-openai-server.plist.j2
+        dest: "/Library/LaunchDaemons/{{ mlx_launchd_label }}.plist"
+        owner: root
+        group: wheel
+        mode: "0644"
+      notify: Reload mlx-openai-server
+
+    - name: Reload the daemon now if its definition changed
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable the daemon at boot and start it
+      become: true
+      community.general.launchd:
+        name: "{{ mlx_launchd_label }}"
+        state: started
+        enabled: true
+
+    - name: Wait for the API port to open
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ mlx_server_port }}"
+        timeout: "{{ mlx_startup_timeout }}"
+
+    - name: Wait for the model to finish loading
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ mlx_server_port }}/v1/models"
+        status_code: 200
+      register: mlx_models
+      until: mlx_models.status == 200
+      retries: "{{ (mlx_startup_timeout | int // 10) | int }}"
+      delay: 10
+
+    # The whole reason for the swap: a tool call must come back as a structured
+    # `tool_calls` array, not as text sitting in `message.content`.
+    - name: Send a tool-call request that must be dispatched, not narrated
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ mlx_server_port }}/v1/chat/completions"
+        method: POST
+        body_format: json
+        body:
+          model: "{{ mlx_served_model_name | default(mlx_model_path, true) }}"
+          temperature: 0
+          stream: false
+          # Force the call rather than `auto`: `auto` lets the model answer in
+          # plain text, which would fail the assertion below for a reason that
+          # has nothing to do with parsing. The parser still has to turn the
+          # model's tool-call output into structured `tool_calls` either way.
+          tool_choice:
+            type: function
+            function:
+              name: get_weather
+          messages:
+            - role: user
+              content: What is the weather in Paris right now?
+          tools:
+            - type: function
+              function:
+                name: get_weather
+                description: Get the current weather for a city.
+                parameters:
+                  type: object
+                  properties:
+                    city:
+                      type: string
+                  required:
+                    - city
+      register: mlx_toolcall
+
+    - name: Assert the tool call parsed into tool_calls, not content
+      vars:
+        message: "{{ mlx_toolcall.json.choices[0].message }}"
+      ansible.builtin.assert:
+        that:
+          - message.tool_calls | default([]) | length > 0
+          - (message.tool_calls | default([]))[0].function.name == "get_weather"
+        fail_msg: >-
+          mlx-openai-server did not return a structured tool call — this is
+          exactly the mlx-lm#1293 failure. message.content was:
+          {{ message.content | default('') | truncate(300) }}
+        success_msg: >-
+          Tool call parsed correctly:
+          {{ message.tool_calls | map(attribute='function.name') | list }}
+
+    - name: Note when the model also emitted prose beside the tool call
+      ansible.builtin.debug:
+        msg: >-
+          message.content was non-empty next to the tool call
+          ({{ mlx_toolcall.json.choices[0].message.content | default('') | truncate(160) }}).
+          tool_calls is still populated, so dispatch works — but a stricter
+          client may want a chat template that suppresses this.
+      when: >-
+        (mlx_toolcall.json.choices[0].message.content | default('') | trim)
+        | length > 0
+
+  handlers:
+    - name: Reload mlx-openai-server
+      become: true
+      community.general.launchd:
+        name: "{{ mlx_launchd_label }}"
+        state: reloaded

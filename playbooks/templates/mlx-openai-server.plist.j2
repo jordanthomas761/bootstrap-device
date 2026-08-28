@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by playbooks/mlx-inference.yml — do not edit by hand. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{ mlx_launchd_label }}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ mlx_server_prefix }}/venv/bin/mlx-openai-server</string>
+        <string>launch</string>
+        <string>--model-path</string>
+        <string>{{ mlx_model_path }}</string>
+        <string>--model-type</string>
+        <string>lm</string>
+        <string>--host</string>
+        <string>{{ mlx_server_host }}</string>
+        <string>--port</string>
+        <string>{{ mlx_server_port }}</string>
+{% if mlx_served_model_name %}
+        <string>--served-model-name</string>
+        <string>{{ mlx_served_model_name }}</string>
+{% endif %}
+{% if mlx_tool_call_parser %}
+        <string>--tool-call-parser</string>
+        <string>{{ mlx_tool_call_parser }}</string>
+{% endif %}
+{% if mlx_reasoning_parser %}
+        <string>--reasoning-parser</string>
+        <string>{{ mlx_reasoning_parser }}</string>
+{% endif %}
+{% if mlx_enable_auto_tool_choice %}
+        <string>--enable-auto-tool-choice</string>
+{% endif %}
+{% for arg in mlx_extra_launch_args %}
+        <string>{{ arg }}</string>
+{% endfor %}
+    </array>
+
+    <!-- Run as the login user: Homebrew, the uv venv and the Hugging Face
+         cache all belong to them, and Metal is reachable from a daemon on
+         Apple Silicon (macOS 14+) as long as it runs as a real user. -->
+    <key>UserName</key>
+    <string>{{ mlx_server_user }}</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{ mlx_server_prefix }}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{ mlx_server_home }}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HF_HOME</key>
+        <string>{{ mlx_hf_home }}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Keep the OS from throttling it as background work; inference wants the
+         GPU and the performance cores. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>{{ mlx_server_prefix }}/logs/mlx-openai-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{ mlx_server_prefix }}/logs/mlx-openai-server.err.log</string>
+</dict>
+</plist>

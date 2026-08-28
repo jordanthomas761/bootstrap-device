@@ -14,6 +14,7 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 - **Development Tools**: Git and other essential development packages
 - **Oh-My-ZSH**: Popular ZSH shell framework for enhanced terminal experience (control plane + workers)
 - **Machine Learning**: Additional ML-related tooling and setup for designated worker(s)
+- **MLX Inference Host**: `mlx-openai-server` on an Apple-Silicon Mac (`pi.dev`), run as a launchd daemon and serving an OpenAI-compatible API to the cluster — see [MLX Inference Host](#mlx-inference-host-pidev)
 
 ## Prerequisites
 
@@ -21,6 +22,7 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 - Ansible installed on your control machine
 - SSH access to all devices
 - An inventory defining `control_plane` and `workers` groups (see `inventory/hosts.yml`)
+- (Optional) An Apple-Silicon Mac reachable over SSH for the `inference` group, if you run [MLX inference](#mlx-inference-host-pidev)
 
 ## Installation
 
@@ -710,6 +712,62 @@ Secret push to the repository defining the cluster. Losing it is recoverable —
 generate a new pair, replace the deploy key, re-run. Unlike the etcd encryption
 key, nothing is lost with it.
 
+## MLX Inference Host (pi.dev)
+
+An Apple-Silicon Mac (`pi.dev`, the `inference` group) serves an
+OpenAI-compatible inference API to the cluster.
+`playbooks/mlx-inference.yml` installs `mlx-openai-server` into a uv-managed
+virtualenv under `/opt/mlx-openai-server`, runs it from a launchd daemon, and
+verifies it before finishing.
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/mlx-inference.yml \
+  -e mlx_model_path=mlx-community/Qwen3-30B-A3B-Instruct-2507-8bit
+```
+
+`mlx_model_path` has no default — set it here or in
+`inventory/group_vars/inference.yml`. Not in `main.yml`: it is the only macOS
+host, it is not always online, and it is not a Kubernetes node.
+
+### Why not `mlx_lm.server`
+
+`mlx_lm.server` chooses its tool-call parser by sniffing the model's chat
+template, and it does not recognise the non-Coder Qwen 3 templates
+([ml-explore/mlx-lm#1293](https://github.com/ml-explore/mlx-lm/issues/1293)).
+The model still emits a tool call, but the server leaves it in
+`choices[].message.content` as raw text instead of parsing it into a structured
+`tool_calls` array — so a client that dispatches on `tool_calls` sees nothing
+and the call silently never runs.
+
+`mlx-openai-server` takes an explicit `--tool-call-parser` /
+`--reasoning-parser` (`qwen3_coder` / `qwen3_moe` here), so the parse no longer
+depends on template detection. The playbook's last step sends a real tool-call
+request and asserts the response comes back as `tool_calls`, not `content` —
+re-running the playbook is the regression test.
+
+### launchd, not a terminal
+
+The daemon definition lives at
+`/Library/LaunchDaemons/site.jordanthomas.mlx-openai-server.plist` (templated
+from `playbooks/templates/mlx-openai-server.plist.j2`). It runs as the login
+user — Homebrew, the venv and the Hugging Face cache all belong to them, and
+Metal is reachable from a daemon on Apple Silicon (macOS 14+) as long as it
+runs as a real user — with `RunAtLoad`, `KeepAlive` and `ProcessType Interactive`
+so the OS does not throttle it as background work. Logs land in
+`/opt/mlx-openai-server/logs/`.
+
+### Still done by hand
+
+Two items from the original change are not automatable from Ansible and are
+tracked in the issue:
+
+- **OPNsense perimeter.** `pfctl -sr` on the firewall, confirm nothing permits
+  `bridge0 → ixl0` (should already be covered by the Kubernetes-LAN ↔
+  Personal-LAN default-deny).
+- **Shared-secret header on the server.** Deferred — `mlx-openai-server` has no
+  built-in API-key auth, and access is currently scoped cluster-side by
+  NetworkPolicy in `homelab-infra`.
+
 ## What Gets Configured
 
 ### System Setup
@@ -730,7 +788,8 @@ key, nothing is lost with it.
 ## Dependencies
 
 - **Ansible Collections**:
-  - `community.general` (>= 7.0.0)
+  - `community.general` (>= 7.0.0) — also provides the `homebrew` and `launchd`
+    modules used by `playbooks/mlx-inference.yml`
   - `kubernetes.core` (>= 3.0.0) — used by `playbooks/argocd-dex-sso.yml`;
     also requires the `python3-kubernetes` apt package on the control-plane
     host (installed automatically by that playbook)
@@ -742,7 +801,7 @@ key, nothing is lost with it.
 ├── main.yml                      # Main playbook orchestrating all configurations
 ├── requirements.yml              # Ansible collection dependencies
 ├── inventory/
-│   ├── hosts.yml                 # control_plane / workers / ml groups
+│   ├── hosts.yml                 # control_plane / workers / ml / inference groups
 │   ├── group_vars/               # cluster-wide + per-group version pins, VIP, CIDR
 │   ├── host_vars/                # per-worker vars (e.g. ML workload labeling)
 │   └── vault/                    # ansible-vault-encrypted secrets, passed explicitly (not auto-loaded; gitignored by default, encrypted files committed with git add -f)
@@ -758,6 +817,7 @@ key, nothing is lost with it.
     ├── control-plane-motd.yml    # Control-plane MOTD
     ├── oh-my-zsh.yml            # ZSH shell setup
     ├── machine-learning.yml      # ML tools and libraries
+    ├── mlx-inference.yml         # mlx-openai-server on pi.dev as a launchd daemon (run on demand, not via main.yml)
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)
     ├── etcd-snapshot-backup.yml  # Installs the verified-snapshot systemd timer (safe to run, no API outage)
@@ -766,7 +826,7 @@ key, nothing is lost with it.
     ├── build-autoinstall-iso.yml # Ubuntu autoinstall seed ISO for the control-plane VM
     ├── files/                    # kube-apiserver manifest patcher (encryption); kubeadm-config/kube-proxy metrics patcher
     ├── tasks/                    # shared task files (node name from kubelet cert; per-node upgrade; metrics endpoints)
-    └── templates/                # user-data / meta-data / EncryptionConfiguration templates
+    └── templates/                # user-data / meta-data / EncryptionConfiguration / mlx launchd plist templates
 ```
 
 ## License
