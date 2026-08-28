@@ -159,6 +159,38 @@
         - upgrade_node_is_control_plane | bool
         - _upgrade_node_enc.stat.exists | default(false)
 
+    # With only two storage nodes, draining one worker leaves every volume on
+    # the other; draining the second before Longhorn has rebuilt the first's
+    # replicas means the drain waits ~10 min on the last-healthy-replica PDB
+    # while the rebuild it needs runs off the node being drained. Gate each
+    # drain on Longhorn being whole again first. No-op where Longhorn isn't
+    # installed, or on a cluster without it.
+    - name: Check whether Longhorn is installed
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get crd volumes.longhorn.io
+      register: _upgrade_node_longhorn
+      changed_when: false
+      failed_when: false
+
+    - name: Wait for every Longhorn volume to be healthy before draining
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf -n longhorn-system
+        get volumes.longhorn.io -o custom-columns=R:.status.robustness --no-headers
+      register: _upgrade_node_lh_vols
+      changed_when: false
+      until: >-
+        _upgrade_node_lh_vols.stdout_lines | map('trim')
+        | reject('eq', 'healthy') | list | length == 0
+      retries: 40
+      delay: 15
+      when: _upgrade_node_longhorn.rc == 0
+
     - name: Cordon and drain {{ kubelet_cert_node_name }}
       delegate_to: "{{ upgrade_node_kubectl_host }}"
       become: true
