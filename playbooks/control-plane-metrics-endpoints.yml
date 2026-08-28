@@ -1,0 +1,42 @@
+---
+# Make the control-plane components' metrics scrapeable from off-box.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/control-plane-metrics-endpoints.yml
+#
+# WHY THIS EXISTS
+#
+# kube-prometheus-stack ships ServiceMonitors and *Down alerts for
+# kube-controller-manager, kube-scheduler, kube-etcd and kube-proxy, all
+# enabled by default. A vanilla `kubeadm init` — which is what this repo does —
+# binds every one of those metrics endpoints to 127.0.0.1:
+#
+#   kube-controller-manager  --bind-address=127.0.0.1          (:10257)
+#   kube-scheduler           --bind-address=127.0.0.1          (:10259)
+#   etcd                     --listen-metrics-urls=...127.0.0.1:2381
+#   kube-proxy               metricsBindAddress: ""  -> 127.0.0.1:10249
+#
+# Prometheus runs on a worker, so it cannot reach any of them. The four targets
+# sit permanently Down and fire KubeControllerManagerDown, KubeSchedulerDown,
+# KubeProxyDown, etcdMembersDown and — alarmingly — etcdInsufficientMembers
+# ("insufficient members (0)"), even though etcd is perfectly healthy. The
+# alert is just `count(up{job="kube-etcd"})`, and nothing can scrape it.
+#
+# This playbook flips each bind address to 0.0.0.0 and writes the same intent
+# into configmap/kubeadm-config and configmap/kube-proxy so `kubeadm upgrade`
+# regenerates the manifests already correct. See
+# tasks/control-plane-metrics-endpoints.yml for the mechanics and the security
+# note on exposing these ports.
+#
+# Deliberately NOT in main.yml, like the etcd-encryption and Dex SSO playbooks:
+# it is a post-bootstrap reconcile, safe to run any time and safe to re-run.
+#
+# Safe to run: kube-controller-manager, kube-scheduler and etcd each restart
+# once; the API server is untouched and stays up through the VIP.
+
+- name: Expose control-plane component metrics for Prometheus
+  hosts: control_plane
+  gather_facts: false
+
+  tasks:
+    - name: Reconcile and apply the metrics endpoints
+      ansible.builtin.import_tasks: tasks/control-plane-metrics-endpoints.yml

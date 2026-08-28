@@ -402,6 +402,13 @@
           {{ k8s_upgrade_final_versions.stdout_lines | map('trim') | list }}
         quiet: true
 
+    # `kubeadm upgrade apply` regenerates the static-pod manifests and the
+    # kube-proxy ConfigMap from the in-cluster kubeadm config, which resets the
+    # component metrics endpoints to loopback. Re-assert them (idempotent — a
+    # no-op once configmap/kubeadm-config carries the extraArgs).
+    - name: Re-assert control-plane metrics exposure
+      ansible.builtin.import_tasks: tasks/control-plane-metrics-endpoints.yml
+
     - name: Wait for kube-system workloads to roll out
       become: true
       become_method: ansible.builtin.sudo
