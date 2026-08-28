@@ -84,11 +84,22 @@ def kubectl(*args, stdin=None):
 
 
 def ensure_extra_arg(component, name, value):
-    """component is a dict like {'extraArgs': [{'name':..., 'value':...}]}.
+    """component is a dict; its "extraArgs" is kubeadm v1beta4's list of
+    {name, value} entries (the map[string]string form was dropped in v1beta4,
+    which is the only API version kubeadm 1.31+ — i.e. this repo — emits).
     Returns True if it had to add or correct the arg."""
-    args = component.setdefault("extraArgs", [])
+    args = component.get("extraArgs")
+    if args is None:
+        args = []
+        component["extraArgs"] = args
+    if not isinstance(args, list):
+        fail(
+            "extraArgs is %s, not a list -- this script expects kubeadm "
+            "v1beta4 ({name, value} entries); the ConfigMap looks older"
+            % type(args).__name__
+        )
     for arg in args:
-        if arg.get("name") == name:
+        if isinstance(arg, dict) and arg.get("name") == name:
             if arg.get("value") == value:
                 return False
             arg["value"] = value
@@ -109,14 +120,16 @@ def patch_kubeadm_config():
 
     changed = []
     for key, (name, value) in CC_WANT.items():
-        section = cc.get(key)
-        if not isinstance(section, dict):
-            section = {}
-            cc[key] = section
+        if key in cc and not isinstance(cc[key], dict):
+            fail("%s is not a mapping -- refusing to edit" % key)
+        section = cc.setdefault(key, {})
         if ensure_extra_arg(section, name, value):
             changed.append("kubeadm-config: %s %s=%s" % (key, name, value))
 
-    etcd_local = cc.setdefault("etcd", {}).setdefault("local", {})
+    etcd = cc.setdefault("etcd", {})
+    if not isinstance(etcd, dict):
+        fail("etcd is not a mapping -- refusing to edit")
+    etcd_local = etcd.setdefault("local", {})
     if not isinstance(etcd_local, dict):
         fail("etcd.local is not a mapping -- refusing to edit")
     name, value = ETCD_WANT

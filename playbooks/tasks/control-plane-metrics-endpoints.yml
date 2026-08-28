@@ -95,6 +95,9 @@
   changed_when: false
   when: (cp_metrics_kcm is changed) or (cp_metrics_ksched is changed) or (cp_metrics_etcd is changed)
 
+# The helper prints one "changed: kube-proxy: ..." line iff it rewrote the
+# kube-proxy ConfigMap. Its no-op message also contains the word "kube-proxy",
+# so gate on rc == 2 (something changed) AND the specific marker.
 - name: Roll kube-proxy so the new metricsBindAddress takes effect
   become: true
   become_method: ansible.builtin.sudo
@@ -102,7 +105,9 @@
     kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system
     rollout restart daemonset/kube-proxy
   changed_when: true
-  when: "'kube-proxy' in (cp_metrics_configmaps.stdout | default(''))"
+  when:
+    - cp_metrics_configmaps.rc == 2
+    - "'changed: kube-proxy:' in (cp_metrics_configmaps.stdout | default(''))"
 
 - name: Wait for the kube-proxy rollout to finish
   become: true
@@ -111,4 +116,6 @@
     kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system
     rollout status daemonset/kube-proxy --timeout=180s
   changed_when: false
-  when: "'kube-proxy' in (cp_metrics_configmaps.stdout | default(''))"
+  when:
+    - cp_metrics_configmaps.rc == 2
+    - "'changed: kube-proxy:' in (cp_metrics_configmaps.stdout | default(''))"
