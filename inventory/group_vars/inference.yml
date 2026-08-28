@@ -9,8 +9,9 @@ mlx_server_user: "{{ ansible_user | default(ansible_user_id) }}"
 mlx_server_home: "/Users/{{ mlx_server_user }}"
 
 # Self-contained install: a uv-managed virtualenv plus logs and the model
-# cache, all under one prefix, so nothing leaks into the login user's dotfiles
-# and a full teardown is `rm -rf` of one directory.
+# cache, all under one prefix, so nothing leaks into the login user's dotfiles.
+# Teardown is two steps: `sudo launchctl bootout system /Library/LaunchDaemons/
+# <mlx_launchd_label>.plist && sudo rm that plist`, then `rm -rf` this prefix.
 mlx_server_prefix: /opt/mlx-openai-server
 mlx_hf_home: "{{ mlx_server_prefix }}/huggingface"
 mlx_uv_bin: /opt/homebrew/bin/uv

@@ -142,12 +142,17 @@
           model: "{{ mlx_served_model_name | default(mlx_model_path, true) }}"
           temperature: 0
           stream: false
-          tool_choice: auto
+          # Force the call rather than `auto`: `auto` lets the model answer in
+          # plain text, which would fail the assertion below for a reason that
+          # has nothing to do with parsing. The parser still has to turn the
+          # model's tool-call output into structured `tool_calls` either way.
+          tool_choice:
+            type: function
+            function:
+              name: get_weather
           messages:
             - role: user
-              content: >-
-                What is the weather in Paris right now? Call the get_weather
-                tool; do not answer from memory.
+              content: What is the weather in Paris right now?
           tools:
             - type: function
               function:
@@ -181,7 +186,7 @@
       ansible.builtin.debug:
         msg: >-
           message.content was non-empty next to the tool call
-          ({{ mlx_toolcall.json.choices[0].message.content | truncate(160) }}).
+          ({{ mlx_toolcall.json.choices[0].message.content | default('') | truncate(160) }}).
           tool_calls is still populated, so dispatch works — but a stricter
           client may want a chat template that suppresses this.
       when: >-
