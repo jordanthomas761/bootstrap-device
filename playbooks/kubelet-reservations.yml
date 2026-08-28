@@ -27,7 +27,9 @@
 # static pods keep serving. The node may flick NotReady for a few seconds,
 # which is why this runs one host at a time.
 - name: Reserve node resources for the system and Kubernetes daemons
-  hosts: all
+  # Every Kubernetes node. Not literally `all`: the inventory also carries the
+  # macOS `inference` host, which has no kubelet.
+  hosts: control_plane:workers
   # One node at a time. Restarting every kubelet at once would take all three
   # NotReady together, and on this cluster that includes the only control
   # plane.

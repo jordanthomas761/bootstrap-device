@@ -1,0 +1,49 @@
+---
+# The Apple-Silicon Mac (pi.dev) that serves MLX inference to the cluster.
+# Consumed by playbooks/mlx-inference.yml — nothing in main.yml touches it.
+
+# User the daemon runs as. mlx-openai-server needs this user's Hugging Face
+# cache and its Metal access, and Homebrew refuses to run as root, so the
+# launchd job drops to this user via the plist's UserName key.
+mlx_server_user: "{{ ansible_user | default(ansible_user_id) }}"
+mlx_server_home: "/Users/{{ mlx_server_user }}"
+
+# Self-contained install: a uv-managed virtualenv plus logs and the model
+# cache, all under one prefix, so nothing leaks into the login user's dotfiles
+# and a full teardown is `rm -rf` of one directory.
+mlx_server_prefix: /opt/mlx-openai-server
+mlx_hf_home: "{{ mlx_server_prefix }}/huggingface"
+mlx_uv_bin: /opt/homebrew/bin/uv
+mlx_python_version: "3.12"
+
+# Pinned. Bump deliberately and re-read the changelog first: the parser names
+# below are the server's, and it has renamed them across minor releases.
+mlx_openai_server_version: "1.8.1"
+
+# REQUIRED. The MLX model repo (or local path) this host serves. Deliberately
+# left unset — serving the wrong model silently is worse than failing the
+# preflight assertion. Set it here or with -e, e.g.
+#   mlx_model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-8bit"
+# mlx_model_path: ""
+
+mlx_server_host: "0.0.0.0"
+mlx_server_port: 8000
+mlx_served_model_name: "qwen3"
+
+# The actual fix for ml-explore/mlx-lm#1293: name the parsers explicitly
+# instead of letting the server sniff the chat template (which does not
+# recognise the non-Coder Qwen 3 templates, so tool calls fall through to
+# message.content as raw text).
+mlx_tool_call_parser: "qwen3_coder"
+mlx_reasoning_parser: "qwen3_moe"
+mlx_enable_auto_tool_choice: true
+
+# Extra `mlx-openai-server launch` flags, appended to ProgramArguments verbatim.
+mlx_extra_launch_args: []
+
+mlx_launchd_label: "site.jordanthomas.mlx-openai-server"
+
+# Startup budget for the verification steps. A cold first run downloads the
+# model, which can take much longer than a warm start — pre-fetch the model
+# into {{ mlx_hf_home }} or raise this if the wait times out.
+mlx_startup_timeout: 1800
