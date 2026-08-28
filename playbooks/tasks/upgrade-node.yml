@@ -101,11 +101,19 @@
         - upgrade_node_is_control_plane | bool
         - not (k8s_upgrade_cp_done | default(false) | bool)
 
+    # Retried: this talks to the API server through the VIP, and the control
+    # plane's own kubelet restart one play earlier bounces kube-vip, so the
+    # first worker can hit a few seconds of "connection refused" here.
+    # `kubeadm upgrade node` is idempotent, so re-running is safe.
     - name: Run kubeadm upgrade node
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.command: kubeadm upgrade node
-      changed_when: true
+      register: _upgrade_node_kubeadm
+      until: _upgrade_node_kubeadm.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: _upgrade_node_kubeadm.rc == 0
       when: not (upgrade_node_is_control_plane | bool)
 
     # `kubeadm upgrade` regenerates the kube-apiserver static pod manifest and
@@ -217,10 +225,16 @@
   always:
     # Never leave a node cordoned, even if the block failed after the drain.
     # The block-level `when` above propagates here, so it is not repeated.
+    # Retried like the drain/wait tasks: the API may be mid-restart when the
+    # block fails, and an un-retried uncordon here would strand the node.
     - name: Uncordon {{ kubelet_cert_node_name }}
       delegate_to: "{{ upgrade_node_kubectl_host }}"
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.command: >
         kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ kubelet_cert_node_name }}
-      changed_when: true
+      register: _upgrade_node_uncordon
+      until: _upgrade_node_uncordon.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: _upgrade_node_uncordon.rc == 0
