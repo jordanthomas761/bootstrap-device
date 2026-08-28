@@ -1,0 +1,121 @@
+# Expose the control-plane components' metrics endpoints so Prometheus — which
+# runs on a worker, not the control plane — can scrape them.
+#
+# A vanilla `kubeadm init` binds every one of these to loopback, so
+# kube-prometheus-stack's kube-controller-manager / kube-scheduler / kube-etcd /
+# kube-proxy targets are permanently down and their *Down alerts fire forever
+# (including a scary-but-false `etcdInsufficientMembers`, because that rule just
+# counts `up{job="kube-etcd"}`).
+#
+# Two layers, because `kubeadm upgrade apply` regenerates both the static-pod
+# manifests and the kube-proxy ConfigMap from the in-cluster kubeadm config:
+#
+#   1. persist the intent  — extraArgs in configmap/kubeadm-config and
+#      metricsBindAddress in configmap/kube-proxy (the helper script), so a
+#      future upgrade regenerates everything already correct.
+#   2. apply it now         — flip the single flag in each live manifest and
+#      restart kube-proxy, so it takes effect without waiting for an upgrade.
+#
+# Safe on a running cluster: kube-controller-manager, kube-scheduler and etcd
+# each restart once when the kubelet notices their manifest changed; the API
+# server itself is not touched and stays reachable through the VIP.
+#
+# Exposure note: :10257 and :10259 keep kubeadm's authn/authz gate. etcd's
+# :2381 is unauthenticated but serves metrics only — no key/value access. This
+# is the standard kube-prometheus-stack trade-off on a trusted LAN.
+#
+# Included by playbooks/control-plane-metrics-endpoints.yml and re-asserted by
+# the Verify play of playbooks/kubernetes-upgrade.yml. Idempotent either way.
+
+- name: Ensure PyYAML is present for the reconcile helper
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    name: python3-yaml
+    state: present
+
+- name: Persist the metrics-exposure intent into kubeadm-config and kube-proxy
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.script: "{{ playbook_dir }}/files/kubeadm-metrics-endpoints-patch.py"
+  register: cp_metrics_configmaps
+  changed_when: cp_metrics_configmaps.rc == 2
+  failed_when: cp_metrics_configmaps.rc not in [0, 2]
+
+- name: Bind kube-controller-manager metrics to every interface
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    regexp: '(--bind-address=)127\.0\.0\.1$'
+    replace: '\g<1>0.0.0.0'
+  register: cp_metrics_kcm
+
+- name: Bind kube-scheduler metrics to every interface
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/kubernetes/manifests/kube-scheduler.yaml
+    regexp: '(--bind-address=)127\.0\.0\.1$'
+    replace: '\g<1>0.0.0.0'
+  register: cp_metrics_ksched
+
+- name: Expose etcd metrics on every interface
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.replace:
+    path: /etc/kubernetes/manifests/etcd.yaml
+    regexp: '(--listen-metrics-urls=http://)127\.0\.0\.1(:2381)$'
+    replace: '\g<1>0.0.0.0\g<2>'
+  register: cp_metrics_etcd
+
+- name: Wait for the API server to report ready after the manifest changes
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw /readyz
+  register: cp_metrics_readyz
+  until: cp_metrics_readyz.rc == 0 and (cp_metrics_readyz.stdout | trim) == 'ok'
+  retries: 60
+  delay: 5
+  changed_when: false
+  when: (cp_metrics_kcm is changed) or (cp_metrics_ksched is changed) or (cp_metrics_etcd is changed)
+
+- name: Wait for the control-plane static pods to be Ready again
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system wait pod
+    --for=condition=Ready --timeout=180s
+    -l tier=control-plane
+  register: cp_metrics_wait
+  until: cp_metrics_wait.rc == 0
+  retries: 6
+  delay: 10
+  changed_when: false
+  when: (cp_metrics_kcm is changed) or (cp_metrics_ksched is changed) or (cp_metrics_etcd is changed)
+
+# The helper prints one "changed: kube-proxy: ..." line iff it rewrote the
+# kube-proxy ConfigMap. Its no-op message also contains the word "kube-proxy",
+# so gate on rc == 2 (something changed) AND the specific marker.
+- name: Roll kube-proxy so the new metricsBindAddress takes effect
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system
+    rollout restart daemonset/kube-proxy
+  changed_when: true
+  when:
+    - cp_metrics_configmaps.rc == 2
+    - "'changed: kube-proxy:' in (cp_metrics_configmaps.stdout | default(''))"
+
+- name: Wait for the kube-proxy rollout to finish
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system
+    rollout status daemonset/kube-proxy --timeout=180s
+  changed_when: false
+  when:
+    - cp_metrics_configmaps.rc == 2
+    - "'changed: kube-proxy:' in (cp_metrics_configmaps.stdout | default(''))"

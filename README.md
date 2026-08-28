@@ -441,6 +441,11 @@ drain hangs. The playbook re-applies that patch (idempotently, using the same
 control plane, whenever `/etc/kubernetes/enc/encryption-config.yaml` is present,
 and waits for `/readyz` before draining.
 
+The same regeneration also resets the control-plane components' metrics
+endpoints to loopback, so the Verify play re-runs the
+[Control-Plane Metrics Endpoints](#control-plane-metrics-endpoints) reconcile at
+the end of every hop.
+
 ### Two things it does not do
 
 - **Compatibility checks.** Cilium (`cilium_version`) and kube-vip
@@ -464,6 +469,42 @@ worker drain blocks on one, the drain task times out. Make sure every volume
 is healthy in the Longhorn UI before running, or scale the noisy workloads
 down first. `k8s_upgrade_drain_timeout` (default `300s`) and
 `k8s_upgrade_drain_extra_args` are the knobs if you need them.
+
+## Control-Plane Metrics Endpoints
+
+`kube-prometheus-stack` ships ServiceMonitors and `*Down` alerts for
+`kube-controller-manager`, `kube-scheduler`, `kube-etcd` and `kube-proxy`, all
+on by default. A stock `kubeadm init` — what this repo does — binds every one of
+those metrics endpoints to `127.0.0.1`:
+
+| component | flag / setting | default |
+| --- | --- | --- |
+| kube-controller-manager | `--bind-address` | `127.0.0.1` (:10257) |
+| kube-scheduler | `--bind-address` | `127.0.0.1` (:10259) |
+| etcd | `--listen-metrics-urls` | `http://127.0.0.1:2381` |
+| kube-proxy | `metricsBindAddress` | `""` → `127.0.0.1:10249` |
+
+Prometheus runs on a worker, so it can't reach any of them. The four targets
+sit permanently down and fire `KubeControllerManagerDown`, `KubeSchedulerDown`,
+`KubeProxyDown`, `etcdMembersDown` and — alarmingly — `etcdInsufficientMembers`
+(*"insufficient members (0)"*), even with etcd perfectly healthy: that rule is
+just `count(up{job="kube-etcd"})`, and nothing can scrape it.
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/control-plane-metrics-endpoints.yml
+```
+
+The playbook flips each bind address to `0.0.0.0` in the live static-pod
+manifests (each pod restarts once; the API server is untouched and stays up
+through the VIP) and writes the same intent into `configmap/kubeadm-config`
+(`controllerManager` / `scheduler` / `etcd.local` `extraArgs`) and
+`configmap/kube-proxy` (`metricsBindAddress`), so a later `kubeadm upgrade`
+regenerates everything already correct. Idempotent and safe to re-run;
+deliberately not in `main.yml`.
+
+`:10257` and `:10259` keep kubeadm's authn/authz gate. etcd's `:2381` is
+unauthenticated but serves metrics only — no key/value access — which is the
+standard trade-off for this on a trusted LAN.
 
 ## Container Registry Mirrors
 
@@ -720,10 +761,11 @@ key, nothing is lost with it.
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)
     ├── etcd-snapshot-backup.yml  # Installs the verified-snapshot systemd timer (safe to run, no API outage)
+    ├── control-plane-metrics-endpoints.yml # Exposes kube-cm/scheduler/etcd/kube-proxy metrics off loopback for Prometheus (run on demand, not via main.yml)
     ├── kubernetes-upgrade.yml    # One-minor kubeadm upgrade: apply, drain, kubelet, uncordon, verify (brief API outage; run per minor)
     ├── build-autoinstall-iso.yml # Ubuntu autoinstall seed ISO for the control-plane VM
-    ├── files/                    # kube-apiserver manifest patcher used by the encryption playbook
-    ├── tasks/                    # shared task files (node name from kubelet cert; per-node upgrade step)
+    ├── files/                    # kube-apiserver manifest patcher (encryption); kubeadm-config/kube-proxy metrics patcher
+    ├── tasks/                    # shared task files (node name from kubelet cert; per-node upgrade; metrics endpoints)
     └── templates/                # user-data / meta-data / EncryptionConfiguration templates
 ```
 
