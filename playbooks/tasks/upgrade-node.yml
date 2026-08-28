@@ -35,7 +35,7 @@
   ansible.builtin.set_fact:
     upgrade_node_needed: >-
       {{ (_upgrade_node_kubelet_ver.stdout | trim
-          | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')) != kubernetes_series }}
+          | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>')) != kubernetes_series }}
 
 - name: Report a node that is already done
   ansible.builtin.debug:

@@ -115,14 +115,16 @@
         k8s_upgrade_server_version: "{{ (k8s_upgrade_version_raw.stdout | from_json).serverVersion.gitVersion }}"
         k8s_upgrade_current_minor: >-
           {{ (k8s_upgrade_version_raw.stdout | from_json).serverVersion.gitVersion
-             | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2') }}
+             | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>') }}
         k8s_upgrade_target_minor: "{{ kubernetes_series }}"
         k8s_upgrade_target_version: "{{ kubernetes_version }}"
 
     - name: Assert the two version pins agree on the minor
       ansible.builtin.assert:
         that:
-          - kubernetes_version | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2') == kubernetes_series
+          # startswith, not a regex: `\1`-style backreferences get mangled by
+          # Ansible's conditional escaping and silently evaluate false here.
+          - kubernetes_package_version.startswith(kubernetes_series ~ '.')
         fail_msg: >-
           kubernetes_package_version ({{ kubernetes_package_version }}) and
           kubernetes_series ({{ kubernetes_series }}) disagree on the minor
@@ -191,7 +193,7 @@
         k8s_upgrade_minors_present: >-
           {{ k8s_upgrade_node_versions.stdout_lines
              | map('split') | map('last')
-             | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')
+             | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>')
              | unique | list }}
 
     - name: Stop if there is nothing left to upgrade
@@ -371,7 +373,7 @@
           - >-
             k8s_upgrade_final_versions.stdout_lines
             | map('split') | map('last')
-            | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')
+            | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>')
             | unique | list == [kubernetes_series]
         fail_msg: >-
           Nodes are still on a mix of versions:
