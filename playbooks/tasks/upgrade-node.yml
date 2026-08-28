@@ -117,6 +117,8 @@
     # for. (python3-yaml is a dependency of the encryption playbook, so it is
     # present wherever the config is.)
     - name: Check for an etcd encryption config to restore
+      become: true
+      become_method: ansible.builtin.sudo
       ansible.builtin.stat:
         path: /etc/kubernetes/enc/encryption-config.yaml
       register: _upgrade_node_enc
