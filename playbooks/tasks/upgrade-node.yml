@@ -35,7 +35,7 @@
   ansible.builtin.set_fact:
     upgrade_node_needed: >-
       {{ (_upgrade_node_kubelet_ver.stdout | trim
-          | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')) != kubernetes_series }}
+          | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>')) != kubernetes_series }}
 
 - name: Report a node that is already done
   ansible.builtin.debug:
@@ -101,12 +101,101 @@
         - upgrade_node_is_control_plane | bool
         - not (k8s_upgrade_cp_done | default(false) | bool)
 
+    # Retried: this talks to the API server through the VIP, and the control
+    # plane's own kubelet restart one play earlier bounces kube-vip, so the
+    # first worker can hit a few seconds of "connection refused" here.
+    # `kubeadm upgrade node` is idempotent, so re-running is safe.
     - name: Run kubeadm upgrade node
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.command: kubeadm upgrade node
-      changed_when: true
+      register: _upgrade_node_kubeadm
+      until: _upgrade_node_kubeadm.rc == 0
+      retries: 12
+      delay: 15
+      changed_when: _upgrade_node_kubeadm.rc == 0
       when: not (upgrade_node_is_control_plane | bool)
+
+    # `kubeadm upgrade` regenerates the kube-apiserver static pod manifest and
+    # keeps only the flags it manages itself. The --encryption-provider-config
+    # wired in out-of-band by playbooks/etcd-encryption-at-rest.yml is dropped
+    # every time — and without it the new apiserver cannot read encrypted
+    # Secrets, never reports Ready, and the drain below hangs. Re-apply the
+    # same idempotent patch this control-plane node already carries the config
+    # for. (python3-yaml is a dependency of the encryption playbook, so it is
+    # present wherever the config is.)
+    - name: Check for an etcd encryption config to restore
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.stat:
+        path: /etc/kubernetes/enc/encryption-config.yaml
+      register: _upgrade_node_enc
+      when: upgrade_node_is_control_plane | bool
+
+    - name: Re-wire the EncryptionConfiguration into the regenerated apiserver manifest
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.script: >
+        {{ playbook_dir }}/files/kube-apiserver-encryption-patch.py
+        /etc/kubernetes/enc/encryption-config.yaml
+      register: _upgrade_node_enc_patch
+      changed_when: _upgrade_node_enc_patch.rc == 2
+      failed_when: _upgrade_node_enc_patch.rc not in [0, 2]
+      when:
+        - upgrade_node_is_control_plane | bool
+        - _upgrade_node_enc.stat.exists | default(false)
+
+    - name: Wait for the API server to report ready after the manifest patch
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw /readyz
+      register: _upgrade_node_readyz
+      until: _upgrade_node_readyz.rc == 0 and (_upgrade_node_readyz.stdout | trim) == 'ok'
+      retries: 60
+      delay: 5
+      changed_when: false
+      when:
+        - upgrade_node_is_control_plane | bool
+        - _upgrade_node_enc.stat.exists | default(false)
+
+    # With only two storage nodes, draining one worker leaves every volume on
+    # the other; draining the second before Longhorn has rebuilt the first's
+    # replicas means the drain waits ~10 min on the last-healthy-replica PDB
+    # while the rebuild it needs runs off the node being drained. Gate each
+    # drain on no volume being degraded first. No-op where Longhorn isn't
+    # installed.
+    #
+    # "degraded" (attached, missing a replica) is the state a drain must not
+    # race. "healthy" is fine; so is "unknown"/"" on a *detached* volume — an
+    # idle or scaled-down workload holds no replica the drain could strand, and
+    # such a volume never reports "healthy", so waiting for it would just burn
+    # the retry budget.
+    - name: Check whether Longhorn is installed
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get crd volumes.longhorn.io
+      register: _upgrade_node_longhorn
+      changed_when: false
+      failed_when: false
+
+    - name: Wait until no Longhorn volume is degraded before draining
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf -n longhorn-system
+        get volumes.longhorn.io -o custom-columns=R:.status.robustness --no-headers
+      register: _upgrade_node_lh_vols
+      changed_when: false
+      until: >-
+        _upgrade_node_lh_vols.stdout_lines | map('trim')
+        | select('eq', 'degraded') | list | length == 0
+      retries: 40
+      delay: 15
+      when: _upgrade_node_longhorn.rc == 0
 
     - name: Cordon and drain {{ kubelet_cert_node_name }}
       delegate_to: "{{ upgrade_node_kubectl_host }}"
@@ -174,10 +263,16 @@
   always:
     # Never leave a node cordoned, even if the block failed after the drain.
     # The block-level `when` above propagates here, so it is not repeated.
+    # Retried like the drain/wait tasks: the API may be mid-restart when the
+    # block fails, and an un-retried uncordon here would strand the node.
     - name: Uncordon {{ kubelet_cert_node_name }}
       delegate_to: "{{ upgrade_node_kubectl_host }}"
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.command: >
         kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ kubelet_cert_node_name }}
-      changed_when: true
+      register: _upgrade_node_uncordon
+      until: _upgrade_node_uncordon.rc == 0
+      retries: 12
+      delay: 10
+      changed_when: _upgrade_node_uncordon.rc == 0

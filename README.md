@@ -429,8 +429,17 @@ helper is not installed.
 Order per run: `kubeadm upgrade apply` on the control plane, then
 `kubeadm upgrade node` on each worker one at a time, with a cordon/drain and a
 kubelet restart around every node. Every step is guarded on the version
-actually observed, so a run that fails on a worker can be re-run and resumes
-where it stopped.
+actually observed, so a run that fails partway can be re-run and resumes where
+it stopped.
+
+`kubeadm upgrade` rewrites the `kube-apiserver` static pod manifest and keeps
+only the flags it manages itself, which drops the `--encryption-provider-config`
+that [etcd Encryption at Rest](#etcd-encryption-at-rest) adds out of band — the
+new apiserver then can't read encrypted Secrets, never reports Ready, and the
+drain hangs. The playbook re-applies that patch (idempotently, using the same
+`kube-apiserver-encryption-patch.py`) right after `kubeadm upgrade` on the
+control plane, whenever `/etc/kubernetes/enc/encryption-config.yaml` is present,
+and waits for `/readyz` before draining.
 
 ### Two things it does not do
 

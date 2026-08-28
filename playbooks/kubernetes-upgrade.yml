@@ -82,8 +82,9 @@
   gather_facts: false
 
   vars:
-    # Set true only if you have an etcd backup by some other means and the
-    # snapshot helper (playbooks/etcd-snapshot-backup.yml) is not installed.
+    # -e k8s_upgrade_skip_snapshot=true skips the pre-upgrade etcd snapshot
+    # entirely. Only do that with an etcd backup by other means — the snapshot
+    # is the rollback point if a hop goes wrong.
     k8s_upgrade_skip_snapshot: false
 
   tasks:
@@ -115,14 +116,16 @@
         k8s_upgrade_server_version: "{{ (k8s_upgrade_version_raw.stdout | from_json).serverVersion.gitVersion }}"
         k8s_upgrade_current_minor: >-
           {{ (k8s_upgrade_version_raw.stdout | from_json).serverVersion.gitVersion
-             | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2') }}
+             | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>') }}
         k8s_upgrade_target_minor: "{{ kubernetes_series }}"
         k8s_upgrade_target_version: "{{ kubernetes_version }}"
 
     - name: Assert the two version pins agree on the minor
       ansible.builtin.assert:
         that:
-          - kubernetes_version | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2') == kubernetes_series
+          # startswith, not a regex: `\1`-style backreferences get mangled by
+          # Ansible's conditional escaping and silently evaluate false here.
+          - kubernetes_package_version.startswith(kubernetes_series ~ '.')
         fail_msg: >-
           kubernetes_package_version ({{ kubernetes_package_version }}) and
           kubernetes_series ({{ kubernetes_series }}) disagree on the minor
@@ -191,7 +194,7 @@
         k8s_upgrade_minors_present: >-
           {{ k8s_upgrade_node_versions.stdout_lines
              | map('split') | map('last')
-             | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')
+             | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>')
              | unique | list }}
 
     - name: Stop if there is nothing left to upgrade
@@ -211,30 +214,48 @@
       ansible.builtin.stat:
         path: "{{ etcd_snapshot_script }}"
       register: k8s_upgrade_snapshot_script
+      when: not (k8s_upgrade_skip_snapshot | bool)
 
     - name: Take a pre-upgrade etcd snapshot
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.command: "{{ etcd_snapshot_script }}"
       register: k8s_upgrade_snapshot
-      changed_when: true
-      when: k8s_upgrade_snapshot_script.stat.exists
+      changed_when: k8s_upgrade_snapshot.rc == 0
+      # Tolerated here and asserted right below: a snapshot failure must stop
+      # the run, but as a clear message that names the override, not a raw
+      # non-zero-exit traceback.
+      failed_when: false
+      when:
+        - not (k8s_upgrade_skip_snapshot | bool)
+        - k8s_upgrade_snapshot_script.stat.exists | default(false)
 
-    - name: Show where the snapshot landed
+    - name: Show the snapshot output
       ansible.builtin.debug:
         var: k8s_upgrade_snapshot.stdout_lines
-      when: k8s_upgrade_snapshot_script.stat.exists
+      when: not (k8s_upgrade_snapshot.skipped | default(true))
 
-    - name: Refuse to continue without a snapshot mechanism
-      ansible.builtin.fail:
-        msg: >-
-          {{ etcd_snapshot_script }} is not installed, so no pre-upgrade etcd
-          snapshot was taken. Run playbooks/etcd-snapshot-backup.yml first, or
-          re-run with -e k8s_upgrade_skip_snapshot=true if you have a backup by
-          other means.
-      when:
-        - not k8s_upgrade_snapshot_script.stat.exists
-        - not (k8s_upgrade_skip_snapshot | bool)
+    - name: Require a verified pre-upgrade etcd snapshot
+      ansible.builtin.assert:
+        that:
+          - >-
+            (k8s_upgrade_skip_snapshot | bool)
+            or ((k8s_upgrade_snapshot_script.stat.exists | default(false))
+                and (k8s_upgrade_snapshot.rc | default(1)) == 0)
+        fail_msg: >-
+          No verified pre-upgrade etcd snapshot. {{ etcd_snapshot_script }}
+          {{ 'is not installed'
+             if not (k8s_upgrade_snapshot_script.stat.exists | default(false))
+             else 'exited ' ~ (k8s_upgrade_snapshot.rc | default('?')) ~ ' — '
+                  ~ (k8s_upgrade_snapshot.stderr | default('') | trim) }}.
+          Fix it (playbooks/etcd-snapshot-backup.yml), or take a backup by other
+          means and re-run with -e k8s_upgrade_skip_snapshot=true.
+        success_msg: >-
+          {{ 'Pre-upgrade etcd snapshot taken.'
+             if not (k8s_upgrade_skip_snapshot | bool)
+             else 'Snapshot skipped on request (k8s_upgrade_skip_snapshot=true) — '
+                  ~ 'confirm you have an etcd backup by other means.' }}
+        quiet: true
 
     - name: Upgrade plan
       ansible.builtin.debug:
@@ -371,7 +392,7 @@
           - >-
             k8s_upgrade_final_versions.stdout_lines
             | map('split') | map('last')
-            | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')
+            | map('regex_replace', '^v([0-9]+)\.([0-9]+)\..*$', '\g<1>.\g<2>')
             | unique | list == [kubernetes_series]
         fail_msg: >-
           Nodes are still on a mix of versions:
