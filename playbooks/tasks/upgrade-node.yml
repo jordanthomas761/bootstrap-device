@@ -187,13 +187,12 @@
       become_method: ansible.builtin.sudo
       ansible.builtin.command: >
         kubectl --kubeconfig=/etc/kubernetes/admin.conf -n longhorn-system
-        get volumes.longhorn.io
-        -o custom-columns=S:.status.state,R:.status.robustness --no-headers
+        get volumes.longhorn.io -o custom-columns=R:.status.robustness --no-headers
       register: _upgrade_node_lh_vols
       changed_when: false
       until: >-
-        _upgrade_node_lh_vols.stdout_lines
-        | select('search', '\bdegraded\b') | list | length == 0
+        _upgrade_node_lh_vols.stdout_lines | map('trim')
+        | select('eq', 'degraded') | list | length == 0
       retries: 40
       delay: 15
       when: _upgrade_node_longhorn.rc == 0
