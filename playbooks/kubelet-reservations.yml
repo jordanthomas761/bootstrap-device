@@ -51,22 +51,11 @@
     # CN is the identity the kubelet actually authenticates as, so it always
     # matches the Node object.
     - name: Determine this node's Kubernetes name from the kubelet certificate
-      become: true
-      become_method: ansible.builtin.sudo
-      ansible.builtin.shell: |
-        set -o pipefail
-        openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
-          -noout -subject |
-          grep -oE 'system:node:[^,/ ]+' | cut -d: -f3
-      args:
-        executable: /bin/bash
-      register: kubelet_reservations_cn
-      changed_when: false
-      failed_when: kubelet_reservations_cn.stdout | trim | length == 0
+      ansible.builtin.include_tasks: tasks/node-name-from-cert.yml
 
     - name: Use the node name from the certificate
       ansible.builtin.set_fact:
-        kubelet_reservations_node_name: "{{ kubelet_reservations_cn.stdout | trim }}"
+        kubelet_reservations_node_name: "{{ kubelet_cert_node_name }}"
 
     # Pin the node's identity before anything restarts the kubelet.
     #

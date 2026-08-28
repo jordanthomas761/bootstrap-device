@@ -1,0 +1,25 @@
+---
+# Derives this host's Kubernetes node name from the CN of its kubelet client
+# certificate (system:node:<name>) — the identity the kubelet actually
+# authenticates as, not `uname -n`. See "The node-name trap" in the README and
+# playbooks/kubelet-reservations.yml for why the hostname cannot be trusted.
+#
+# Sets: kubelet_cert_node_name
+
+- name: Read the node name from the kubelet client certificate
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.shell: |
+    set -o pipefail
+    openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
+      -noout -subject |
+      grep -oE 'system:node:[^,/ ]+' | cut -d: -f3
+  args:
+    executable: /bin/bash
+  register: _kubelet_cert_subject
+  changed_when: false
+  failed_when: _kubelet_cert_subject.stdout | trim | length == 0
+
+- name: Set kubelet_cert_node_name
+  ansible.builtin.set_fact:
+    kubelet_cert_node_name: "{{ _kubelet_cert_subject.stdout | trim }}"

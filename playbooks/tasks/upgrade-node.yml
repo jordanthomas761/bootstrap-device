@@ -1,0 +1,183 @@
+---
+# Upgrades ONE already-joined node by one Kubernetes minor. The control plane
+# and a worker differ only in the kubeadm sub-command and in which host runs
+# kubectl, so both go through this one file — included once per play from
+# playbooks/kubernetes-upgrade.yml (control plane first, then each worker).
+#
+# Expects:
+#   upgrade_node_is_control_plane  bool  `kubeadm upgrade apply` vs `... node`
+#   upgrade_node_kubectl_host      str   host holding admin.conf; drain,
+#                                        uncordon and the Ready wait run there
+#                                        (the node itself for the control
+#                                        plane, the control plane for a worker)
+#
+# Also needs the "Restart kubelet" handler in the calling play, and the
+# k8s_upgrade_cp_done fact from the preflight play.
+
+- name: Identify this node from its kubelet certificate
+  ansible.builtin.include_tasks: node-name-from-cert.yml
+
+- name: Read this node's current kubelet version
+  delegate_to: "{{ upgrade_node_kubectl_host }}"
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: >
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get node {{ kubelet_cert_node_name }}
+    --no-headers -o custom-columns=V:.status.nodeInfo.kubeletVersion
+  register: _upgrade_node_kubelet_ver
+  changed_when: false
+
+# The single guard the whole upgrade hangs off: a node is touched only while
+# its kubelet is still on an older minor. That makes every run resumable — a
+# run that dies on one node re-runs and skips whatever already finished — and
+# it is what stops a re-run from needlessly draining a node that is done.
+- name: Decide whether this node still needs the upgrade
+  ansible.builtin.set_fact:
+    upgrade_node_needed: >-
+      {{ (_upgrade_node_kubelet_ver.stdout | trim
+          | regex_replace('^v([0-9]+)\.([0-9]+)\..*$', '\1.\2')) != kubernetes_series }}
+
+- name: Report a node that is already done
+  ansible.builtin.debug:
+    msg: "{{ kubelet_cert_node_name }} is already on {{ _upgrade_node_kubelet_ver.stdout | trim }} — skipping."
+  when: not (upgrade_node_needed | bool)
+
+- name: "Upgrade {{ kubelet_cert_node_name }}"
+  when: upgrade_node_needed | bool
+  block:
+    - name: Unhold kubeadm
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: install
+
+    - name: Install the target kubeadm
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: "kubeadm={{ kubernetes_package_version }}"
+        state: present
+        allow_downgrade: false
+        update_cache: false
+
+    - name: Hold kubeadm again
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: kubeadm
+        selection: hold
+
+    # Control plane, and only if the API server is not already on the target:
+    # on a resumed run where `apply` succeeded before a later step failed,
+    # re-running `kubeadm upgrade apply` with the same version errors out.
+    - name: Show the kubeadm upgrade plan
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: kubeadm upgrade plan {{ kubernetes_version }}
+      register: _upgrade_node_plan
+      changed_when: false
+      when:
+        - upgrade_node_is_control_plane | bool
+        - not (k8s_upgrade_cp_done | default(false) | bool)
+
+    - name: Print the kubeadm upgrade plan
+      ansible.builtin.debug:
+        var: _upgrade_node_plan.stdout_lines
+      when:
+        - upgrade_node_is_control_plane | bool
+        - not (k8s_upgrade_cp_done | default(false) | bool)
+
+    # async: `apply` restarts the API server and etcd under itself and can run
+    # for several minutes; a backgrounded job survives an SSH hiccup.
+    - name: Run kubeadm upgrade apply {{ kubernetes_version }}
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: kubeadm upgrade apply -y {{ kubernetes_version }}
+      async: 1200
+      poll: 15
+      changed_when: true
+      when:
+        - upgrade_node_is_control_plane | bool
+        - not (k8s_upgrade_cp_done | default(false) | bool)
+
+    - name: Run kubeadm upgrade node
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: kubeadm upgrade node
+      changed_when: true
+      when: not (upgrade_node_is_control_plane | bool)
+
+    - name: Cordon and drain {{ kubelet_cert_node_name }}
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf drain {{ kubelet_cert_node_name }}
+        --ignore-daemonsets --delete-emptydir-data --force
+        --timeout={{ k8s_upgrade_drain_timeout | default('300s') }}
+        {{ k8s_upgrade_drain_extra_args | default('') }}
+      register: _upgrade_node_drain
+      changed_when: true
+      retries: 3
+      delay: 15
+      until: _upgrade_node_drain.rc == 0
+
+    - name: Unhold kubelet and kubectl
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Install the target kubelet and kubectl
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ kubernetes_package_version }}"
+          - "kubectl={{ kubernetes_package_version }}"
+        state: present
+        allow_downgrade: false
+        update_cache: false
+      notify: Restart kubelet
+
+    - name: Hold kubelet and kubectl again
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubectl
+
+    - name: Restart the kubelet before going on
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the node to report Ready after the kubelet restart
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf wait
+        --for=condition=Ready node/{{ kubelet_cert_node_name }} --timeout=180s
+      register: _upgrade_node_ready
+      changed_when: false
+      retries: 5
+      delay: 15
+      until: _upgrade_node_ready.rc == 0
+
+  always:
+    # Never leave a node cordoned, even if the block failed after the drain.
+    # The block-level `when` above propagates here, so it is not repeated.
+    - name: Uncordon {{ kubelet_cert_node_name }}
+      delegate_to: "{{ upgrade_node_kubectl_host }}"
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {{ kubelet_cert_node_name }}
+      changed_when: true

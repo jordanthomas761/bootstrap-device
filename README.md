@@ -714,6 +714,7 @@ key, nothing is lost with it.
     ├── kubernetes-upgrade.yml    # One-minor kubeadm upgrade: apply, drain, kubelet, uncordon, verify (brief API outage; run per minor)
     ├── build-autoinstall-iso.yml # Ubuntu autoinstall seed ISO for the control-plane VM
     ├── files/                    # kube-apiserver manifest patcher used by the encryption playbook
+    ├── tasks/                    # shared task files (node name from kubelet cert; per-node upgrade step)
     └── templates/                # user-data / meta-data / EncryptionConfiguration templates
 ```
 
