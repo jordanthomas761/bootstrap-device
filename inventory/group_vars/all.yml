@@ -4,7 +4,7 @@
 # values below to the next minor and run playbooks/kubernetes-upgrade.yml,
 # which does the apply/drain/kubelet/uncordon dance and refuses a two-minor
 # jump. See "Kubernetes Version Upgrades" in the README.
-kubernetes_series: "1.31"
+kubernetes_series: "1.32"
 # Exact package version+revision pinned identically across control_plane and workers.
 # Find the right string with: apt-cache madison kubeadm  (after the kubernetes apt repo is added)
 #
@@ -22,7 +22,7 @@ kubernetes_series: "1.31"
 # The hold is the guard that stopped a live kubelet downgrade; the drifted pin
 # was the bug. Keep this value equal to what the nodes actually run, and check
 # with `apt-cache madison kubelet` before changing it.
-kubernetes_package_version: "1.31.14-1.1"
+kubernetes_package_version: "1.32.13-1.1"
 # Derived for --kubernetes-version on kubeadm init/join — kept in sync with the pin above automatically.
 kubernetes_version: "v{{ kubernetes_package_version.split('-')[0] }}"
 
