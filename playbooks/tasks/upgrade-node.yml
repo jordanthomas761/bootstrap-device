@@ -143,7 +143,35 @@
       failed_when: _upgrade_node_enc_patch.rc not in [0, 2]
       when:
         - upgrade_node_is_control_plane | bool
-        - _upgrade_node_enc.stat.exists | default(false)
+        - (_upgrade_node_enc.stat.exists | default(false)) or (_upgrade_node_oidc.stat.exists | default(false))
+
+    # Same story for the OIDC flags from playbooks/apiserver-oidc.yml. Detected
+    # by the flag having been configured before, i.e. the backup that playbook
+    # leaves behind, so clusters that never ran it are not changed.
+    - name: Check for an OIDC apiserver configuration to restore
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kube-apiserver.yaml.pre-oidc
+      register: _upgrade_node_oidc
+      when: upgrade_node_is_control_plane | bool
+
+    - name: Re-apply the OIDC flags to the regenerated apiserver manifest
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.script:
+        cmd: >
+          {{ playbook_dir }}/files/kube-apiserver-oidc-patch.py
+          --oidc-issuer-url={{ apiserver_oidc_issuer_url }}
+          --oidc-client-id={{ apiserver_oidc_client_id }}
+          --oidc-username-claim={{ apiserver_oidc_username_claim }}
+          --oidc-groups-claim={{ apiserver_oidc_groups_claim }}
+      register: _upgrade_node_oidc_patch
+      changed_when: _upgrade_node_oidc_patch.rc == 2
+      failed_when: _upgrade_node_oidc_patch.rc not in [0, 2]
+      when:
+        - upgrade_node_is_control_plane | bool
+        - _upgrade_node_oidc.stat.exists | default(false)
 
     - name: Wait for the API server to report ready after the manifest patch
       become: true
@@ -157,7 +185,7 @@
       changed_when: false
       when:
         - upgrade_node_is_control_plane | bool
-        - _upgrade_node_enc.stat.exists | default(false)
+        - (_upgrade_node_enc.stat.exists | default(false)) or (_upgrade_node_oidc.stat.exists | default(false))
 
     # With only two storage nodes, draining one worker leaves every volume on
     # the other; draining the second before Longhorn has rebuilt the first's

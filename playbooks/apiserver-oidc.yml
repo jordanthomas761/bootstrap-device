@@ -1,0 +1,110 @@
+# Makes kube-apiserver trust Dex as an OIDC issuer, so a Dex ID token is a
+# valid bearer token. Headlamp (and any other OIDC client of Dex that registers
+# the same client id) forwards the signed-in user's token to the apiserver;
+# without these flags the apiserver answers 401 and Headlamp hangs on its
+# "Redirecting to main page" screen.
+#
+# Authorization is separate and lives in homelab-infra
+# (apps/headlamp/manifests: a ClusterRoleBinding granting the kube-admins group).
+#
+# Run on demand, NOT in main.yml -- it restarts kube-apiserver:
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/apiserver-oidc.yml
+#
+# Single control plane, so the restart is a brief full API outage (~15-30s).
+# Take an etcd snapshot first if it has been a while: /usr/local/sbin/etcd-snapshot
+# (see playbooks/etcd-snapshot-backup.yml).
+#
+# Safe to re-run. `kubeadm upgrade` regenerates the apiserver manifest and drops
+# these flags; playbooks/tasks/upgrade-node.yml re-applies them.
+- name: Configure kube-apiserver to accept Dex OIDC tokens
+  hosts: control_plane
+
+  tasks:
+    - name: Assert this host is an initialized control plane
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: apiserver_oidc_admin_conf
+      failed_when: not apiserver_oidc_admin_conf.stat.exists
+
+    - name: Check whether PyYAML is already importable
+      ansible.builtin.command: python3 -c "import yaml"
+      register: apiserver_oidc_pyyaml
+      changed_when: false
+      failed_when: false
+
+    - name: Install PyYAML (required by the kube-apiserver manifest patcher)
+      when: apiserver_oidc_pyyaml.rc != 0
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.apt:
+        name: python3-yaml
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # The apiserver fetches the issuer's discovery document lazily, so a wrong
+    # URL does not stop it starting -- it just 401s every OIDC token. Catch the
+    # common failure (this host cannot resolve/reach Dex) before restarting.
+    - name: Check the Dex discovery document is reachable from the control plane
+      ansible.builtin.uri:
+        url: "{{ apiserver_oidc_issuer_url }}/.well-known/openid-configuration"
+        return_content: true
+      register: apiserver_oidc_discovery
+
+    - name: Assert the discovery document names the same issuer
+      ansible.builtin.assert:
+        that:
+          - apiserver_oidc_discovery.json.issuer == apiserver_oidc_issuer_url
+        fail_msg: >-
+          Dex reports issuer {{ apiserver_oidc_discovery.json.issuer }}, not
+          {{ apiserver_oidc_issuer_url }}. The apiserver compares these exactly
+          and would reject every token.
+        quiet: true
+
+    # Patching the manifest makes the kubelet restart the apiserver on its own,
+    # so there is no separate restart handler here (unlike the encryption
+    # playbook, whose config-file-only changes need one).
+    - name: Wire the OIDC flags into the kube-apiserver manifest
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.script:
+        cmd: >
+          files/kube-apiserver-oidc-patch.py
+          --oidc-issuer-url={{ apiserver_oidc_issuer_url }}
+          --oidc-client-id={{ apiserver_oidc_client_id }}
+          --oidc-username-claim={{ apiserver_oidc_username_claim }}
+          --oidc-groups-claim={{ apiserver_oidc_groups_claim }}
+      register: apiserver_oidc_patch
+      changed_when: apiserver_oidc_patch.rc == 2
+      failed_when: apiserver_oidc_patch.rc not in [0, 2]
+
+    - name: Wait for the API server to report ready
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw /readyz
+      register: apiserver_oidc_readyz
+      until: apiserver_oidc_readyz.rc == 0 and (apiserver_oidc_readyz.stdout | trim) == 'ok'
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: Confirm the running apiserver carries the flags
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get pod
+        -l component=kube-apiserver
+        -o jsonpath='{.items[0].spec.containers[0].command}'
+      args:
+        executable: /bin/bash
+      register: apiserver_oidc_running
+      # Retried because right after the patch the kubelet may not have swapped
+      # the pod yet, so the OLD apiserver can still answer the readiness check
+      # above; it would not carry the flag.
+      until: "('--oidc-issuer-url=' + apiserver_oidc_issuer_url) in apiserver_oidc_running.stdout"
+      retries: 30
+      delay: 5
+      changed_when: false
