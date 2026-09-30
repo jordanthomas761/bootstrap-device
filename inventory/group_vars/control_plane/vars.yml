@@ -41,6 +41,15 @@ argocd_dex_requested_scopes:
 # admin role in playbooks/argocd-dex-sso.yml.
 argocd_dex_admin_group: kube-admins
 
+# kube-apiserver OIDC (see playbooks/apiserver-oidc.yml). Lets the apiserver
+# accept Dex-issued tokens, which Headlamp forwards per user. The client id must
+# match the Dex staticClient Headlamp logs in with; Dex sets aud to it.
+# email_verified is true for the LDAP connector, which the email claim needs.
+apiserver_oidc_issuer_url: "https://dex.jordanthomas.site"
+apiserver_oidc_client_id: headlamp
+apiserver_oidc_username_claim: email
+apiserver_oidc_groups_claim: groups
+
 # etcd encryption at rest (see playbooks/etcd-encryption-at-rest.yml).
 # The key itself is NOT here and never goes in git — it is generated on the
 # control plane at etcd_encryption_key_file and stays there.
