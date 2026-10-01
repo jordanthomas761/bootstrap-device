@@ -28,7 +28,8 @@ spec:
         - name: svc_enable
           value: "false"
         - name: vip_leaderelection
-          value: "true"
+          value: "{{ kube_vip_leader_election | lower }}"
+{% if kube_vip_leader_election %}
         - name: vip_leasename
           value: plndr-cp-lock
         - name: vip_leaseduration
@@ -37,6 +38,7 @@ spec:
           value: "3"
         - name: vip_retryperiod
           value: "1"
+{% endif %}
         - name: address
           value: "{{ k8s_vip }}"
       securityContext:
