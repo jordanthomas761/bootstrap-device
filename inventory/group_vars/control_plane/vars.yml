@@ -3,6 +3,12 @@ k8s_vip: "192.168.30.120"
 k8s_control_plane_endpoint_port: 6443
 k8s_pod_network_cidr: "10.244.0.0/16"
 kube_vip_version: "v0.8.9"
+# Leader election only matters with several control-plane nodes contending for
+# the VIP. With one, it is pure downside: a >3s apiserver/etcd stall fails the
+# lease renewal, kube-vip exits and drops the VIP until kubelet restarts it
+# (seen 2026-09-30 mid-playbook: kubectl on the CP got "no route to host").
+# Set true again if a second control-plane node is ever added.
+kube_vip_leader_election: false
 # Check https://github.com/cilium/cilium-cli/releases and
 # https://github.com/cilium/cilium/releases for newer tags before bumping.
 #
