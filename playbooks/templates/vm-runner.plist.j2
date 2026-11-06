@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by playbooks/vm-runner.yml — do not edit by hand. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{ vm_runner_label }}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ vm_runner_bin_dir }}/vm-runner</string>
+    </array>
+
+    <!-- A system daemon, so it starts at boot with nobody logged in, but it
+         drops to the unprivileged service user. Only the socket_vmnet helper
+         (its own daemon) runs as root. -->
+    <key>UserName</key>
+    <string>{{ vm_runner_user }}</string>
+    <key>GroupName</key>
+    <string>{{ vm_runner_group }}</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{ vm_runner_dir }}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>{{ vm_runner_dir }}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only if QEMU or the supervisor fails. A clean exit, such as the
+         guest powering off after a shutdown, must stay off. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- launchd's 20 s default would SIGKILL the supervisor in the middle of
+         the snapshot and the guest's ~90 s shutdown. -->
+    <key>ExitTimeOut</key>
+    <integer>{{ vm_runner_exit_timeout }}</integer>
+
+    <!-- Keep the OS from throttling it as background work. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>{{ vm_runner_dir }}/runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{ vm_runner_dir }}/runner.log</string>
+</dict>
+</plist>

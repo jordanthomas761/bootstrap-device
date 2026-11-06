@@ -1,0 +1,178 @@
+# Installs the headless QEMU runner for the control-plane VM on the Mac that
+# hosts it, so the VM starts at boot with nobody logged in.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/vm-runner.yml -K
+#
+# This only INSTALLS. It does not start anything unless you pass
+# -e vm_runner_load=true, which is the last step of the cutover. The full
+# procedure, and how to roll back, is in the README ("Headless control-plane VM").
+#
+# WHAT IT SETS UP
+#
+#   - an unprivileged, hidden service user (vm_runner_user) with no login shell
+#   - /var/vm/controlplane (disk, EFI variables, firmware copy, QMP socket,
+#     serial log, the runner's own ssh key), owned by that user
+#   - a root-owned supervisor script and a boot-time LaunchDaemon that runs it
+#     as the service user
+#
+# WHAT IT NEEDS FIRST (checked below, not installed here)
+#
+#   - Homebrew QEMU (`brew install qemu`)
+#   - socket_vmnet from a root-owned prefix, with its bridged LaunchDaemon
+#     running. Not Homebrew's build: its README warns that admin-group users can
+#     replace a binary root runs. Install steps are in the README.
+#
+# ORDER
+#
+#   1. this playbook (creates the runner's ssh key)
+#   2. playbooks/vm-ctl-access.yml (authorizes that key as the restricted vm-ctl
+#      user on the control plane; the supervisor uses it for the snapshot and the
+#      cordon/uncordon)
+#   3. the manual cutover, then this playbook again with -e vm_runner_load=true
+- name: Install the headless QEMU runner
+  hosts: vm_host
+  become: true
+  become_method: ansible.builtin.sudo
+
+  tasks:
+    - name: Assert this is an Apple-Silicon Mac
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system == "Darwin"
+          - ansible_facts.architecture == "arm64"
+        fail_msg: playbooks/vm-runner.yml targets the Apple-Silicon Mac that hosts the VM.
+
+    - name: Check the prerequisites
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ vm_qemu_bin }}"
+        - "{{ vm_socket_vmnet_client }}"
+        - "{{ vm_socket_vmnet_socket }}"
+      register: vm_runner_prereqs
+
+    - name: Require them
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: >-
+          {{ item.item }} does not exist. QEMU comes from `brew install qemu`;
+          socket_vmnet and its bridged daemon are installed per the README.
+      loop: "{{ vm_runner_prereqs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Create the service user
+      ansible.builtin.user:
+        name: "{{ vm_runner_user }}"
+        uid: "{{ vm_runner_uid }}"
+        group: "{{ vm_runner_group }}"
+        home: "{{ vm_runner_home }}"
+        shell: /usr/bin/false
+        create_home: false
+        hidden: true
+        comment: "Control-plane VM runner"
+
+    - name: Create the VM directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ vm_runner_group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ vm_runner_home }}", owner: root, mode: "0755" }
+        - { path: "{{ vm_runner_dir }}", owner: "{{ vm_runner_user }}", mode: "0750" }
+        - { path: "{{ vm_runner_dir }}/.ssh", owner: "{{ vm_runner_user }}", mode: "0700" }
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Generate the runner's vm-ctl key (kept if it exists)
+      become: true
+      become_user: "{{ vm_runner_user }}"
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -t
+          - ed25519
+          - -N
+          - ""
+          - -C
+          - "vm-runner@{{ inventory_hostname }}"
+          - -f
+          - "{{ vm_runner_dir }}/.ssh/id_ed25519_vm_ctl"
+      args:
+        creates: "{{ vm_runner_dir }}/.ssh/id_ed25519_vm_ctl"
+
+    # .ssh is private (0700), so playbooks/vm-ctl-access.yml reads the public half
+    # from here instead.
+    - name: Publish the runner's public key where vm-ctl-access can read it
+      ansible.builtin.copy:
+        src: "{{ vm_runner_dir }}/.ssh/id_ed25519_vm_ctl.pub"
+        dest: "{{ vm_runner_dir }}/vm-ctl.pub"
+        remote_src: true
+        owner: "{{ vm_runner_user }}"
+        group: "{{ vm_runner_group }}"
+        mode: "0644"
+
+    - name: Create the root-owned script directory
+      ansible.builtin.file:
+        path: "{{ vm_runner_bin_dir }}"
+        state: directory
+        owner: root
+        group: wheel
+        mode: "0755"
+
+    - name: Install the supervisor script
+      ansible.builtin.template:
+        src: templates/vm-runner.sh.j2
+        dest: "{{ vm_runner_bin_dir }}/vm-runner"
+        owner: root
+        group: wheel
+        mode: "0755"
+
+    - name: Install the LaunchDaemon
+      ansible.builtin.template:
+        src: templates/vm-runner.plist.j2
+        dest: "/Library/LaunchDaemons/{{ vm_runner_label }}.plist"
+        owner: root
+        group: wheel
+        mode: "0644"
+      register: vm_runner_plist
+
+    - name: Say where things stand
+      ansible.builtin.debug:
+        msg: >-
+          Installed. {{ 'Loading the daemon now.' if vm_runner_load | bool else
+          'Not loaded: this was an install only. After the cutover, rerun with
+          -e vm_runner_load=true.' }}
+
+    # The UTM-based agents from playbooks/vm-host-lifecycle.yml must go before the
+    # runner starts: their login agent would start the now-stale UTM VM, with the
+    # same MAC and IP, next to the runner's. bootout from root works on a user's
+    # gui domain; the plists are removed so they do not return at next login.
+    - name: Look up the login user's uid (for the agents being retired)
+      ansible.builtin.stat:
+        path: "{{ vm_host_home }}"
+      register: vm_runner_login_home
+      when: vm_runner_load | bool
+
+    - name: Retire the UTM-based LaunchAgents (cutover only)
+      ansible.builtin.shell: |
+        launchctl bootout gui/{{ vm_runner_login_home.stat.uid }}/{{ vm_lifecycle_label_prefix }}.{{ item }} 2>/dev/null || true
+        rm -f "{{ vm_lifecycle_agents_dir }}/{{ vm_lifecycle_label_prefix }}.{{ item }}.plist"
+      loop:
+        - shutdown-hook
+        - startup
+        - shutdown-run
+      when: vm_runner_load | bool
+      changed_when: true
+
+    # Loading starts QEMU. bootout first so a re-run picks up a changed plist; it
+    # fails harmlessly when the job is not loaded yet.
+    - name: Load the daemon (cutover only)
+      ansible.builtin.shell: |
+        launchctl bootout system/{{ vm_runner_label }} 2>/dev/null || true
+        launchctl bootstrap system /Library/LaunchDaemons/{{ vm_runner_label }}.plist
+        launchctl enable system/{{ vm_runner_label }}
+      when: vm_runner_load | bool
+      changed_when: true

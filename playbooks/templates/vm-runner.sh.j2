@@ -1,0 +1,127 @@
+#!/bin/bash
+# Managed by playbooks/vm-runner.yml — do not hand-edit.
+#
+# Supervises QEMU for the control-plane VM. launchd runs this at boot as an
+# unprivileged service user; QEMU gets its bridged network through the root
+# socket_vmnet helper's unix socket, so nothing here needs root.
+#
+#   start: preflight, launch QEMU, then (in the background) wait for the API and
+#          uncordon the nodes the last shutdown cordoned.
+#   stop:  on SIGTERM (launchd at shutdown/restart or `launchctl bootout`) cordon
+#          the nodes, take a verified etcd snapshot, press the VM's virtual power
+#          button (ACPI), and wait for the guest to power itself off.
+#
+# Preflight problems exit 0 on purpose: with KeepAlive set to restart only on
+# failure, a "not ready" refusal must not turn into a restart loop. Fix the
+# cause, then `sudo launchctl kickstart system/{{ vm_runner_label }}`.
+set -uo pipefail
+
+NAME="{{ vm_name }}"
+DIR="{{ vm_runner_dir }}"
+QEMU="{{ vm_qemu_bin }}"
+CLIENT="{{ vm_socket_vmnet_client }}"
+VMNET_SOCK="{{ vm_socket_vmnet_socket }}"
+QMP="$DIR/qmp.sock"
+CP="{{ vm_ctl_user }}@{{ cluster_cp_host }}"
+KEY="$DIR/.ssh/id_ed25519_vm_ctl"
+STOP_TIMEOUT={{ vm_runner_stop_timeout }}
+BOOT_TIMEOUT={{ vm_runner_boot_timeout }}
+
+log() { echo "[vm-runner] $(date '+%F %T') $*"; }
+refuse() { log "NOT STARTING: $*"; exit 0; }
+
+# The vm-ctl account can run only fixed verbs (ping, snapshot, cordon, uncordon,
+# ready, ...); see playbooks/vm-ctl-access.yml. There is no shell on the far end.
+ctl() {
+  ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$DIR/.ssh/known_hosts" \
+    "$CP" "$@"
+}
+
+# One QMP command (ACPI power button, or a last-resort quit).
+# shellcheck disable=SC2329  # called from graceful_stop, which runs via trap
+qmp() {
+  printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$1" | nc -U -w 3 "$QMP" >/dev/null 2>&1
+}
+
+# --- preflight ---------------------------------------------------------------
+# Two machines with one MAC and one disk would corrupt the cluster, so refuse if
+# any QEMU for this VM, or any UTM-hosted VM, is already running.
+if pgrep -f "qemu-system-aarch64.*-name $NAME" >/dev/null 2>&1 || pgrep -f 'qemu-aarch64-softmmu' >/dev/null 2>&1; then
+  refuse "another QEMU for this VM, or a UTM VM, is already running"
+fi
+for f in "$DIR/disk.qcow2" "$DIR/efi_vars.fd" "$DIR/edk2-aarch64-code.fd"; do
+  [ -r "$f" ] || refuse "cannot read $f (is the cutover done, and owned by the service user?)"
+done
+waited=0
+until [ -S "$VMNET_SOCK" ]; do
+  [ "$waited" -lt 120 ] || refuse "socket_vmnet socket $VMNET_SOCK is not up"
+  sleep 2
+  waited=$((waited + 2))
+done
+
+# --- start -------------------------------------------------------------------
+rm -f "$QMP"
+log "starting QEMU for '$NAME' ({{ vm_machine }}, {{ vm_cpus }} CPU, {{ vm_memory_mb }} MB)"
+# Device order matters: the NIC must be the first PCI device, or the guest sees
+# it as enp0s2 and netplan (bound to the name enp0s1) leaves it unconfigured.
+"$CLIENT" "$VMNET_SOCK" "$QEMU" \
+  -name "$NAME" -uuid "{{ vm_uuid }}" \
+  -machine {{ vm_machine }} -accel hvf -cpu host \
+  -smp cpus={{ vm_cpus }},sockets=1,cores={{ vm_cpus }},threads=1 -m {{ vm_memory_mb }} \
+  -nodefaults -display none -vga none -monitor none -serial "file:$DIR/serial.log" \
+  -device virtio-net-pci,mac={{ vm_mac }},netdev=net0 -netdev socket,id=net0,fd=3 \
+  -drive if=pflash,format=raw,unit=0,file="$DIR/edk2-aarch64-code.fd",readonly=on \
+  -drive if=pflash,format=qcow2,unit=1,file="$DIR/efi_vars.fd" \
+  -device virtio-blk-pci,drive=hd0,serial={{ vm_disk_serial }},bootindex=1 \
+  -drive if=none,media=disk,id=hd0,file="$DIR/disk.qcow2",discard=unmap,detect-zeroes=unmap \
+  -device virtio-rng-pci \
+  -qmp "unix:$QMP,server=on,wait=off" &
+QPID=$!
+
+# --- stop --------------------------------------------------------------------
+# shellcheck disable=SC2329  # invoked through the trap below
+graceful_stop() {
+  log "stop requested"
+  if ctl ping >/dev/null 2>&1; then
+    log "cordoning nodes and taking a verified etcd snapshot"
+    ctl cordon || log "WARNING: cordon failed; continuing"
+    ctl snapshot || log "WARNING: snapshot failed; powering off anyway"
+  else
+    log "WARNING: cannot reach the guest over SSH; skipping cordon and snapshot"
+  fi
+
+  log "pressing the virtual power button (ACPI)"
+  qmp system_powerdown
+
+  waited=0
+  while kill -0 "$QPID" 2>/dev/null; do
+    if [ "$waited" -ge "$STOP_TIMEOUT" ]; then
+      log "ERROR: guest still running after ${STOP_TIMEOUT}s; quitting QEMU (abrupt)"
+      qmp quit
+      sleep 3
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  log "stopped"
+  exit 0
+}
+trap graceful_stop TERM INT HUP
+
+# --- after boot: undo the previous shutdown's cordon -------------------------
+(
+  until ctl ready >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$BOOT_TIMEOUT" ] || { log "API not ready after ${BOOT_TIMEOUT}s; leaving nodes as they are"; exit 0; }
+    sleep 5
+  done
+  log "API ready; uncordoning nodes that the last shutdown cordoned"
+  ctl uncordon || log "WARNING: uncordon failed"
+) &
+
+# --- run until QEMU exits ----------------------------------------------------
+wait "$QPID"
+rc=$?
+log "QEMU exited with status $rc"
+exit "$rc"
