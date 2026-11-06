@@ -1,0 +1,89 @@
+#!/bin/bash
+# Managed by playbooks/vm-host-lifecycle.yml — do not hand-edit.
+#
+# Cleanly shuts the control-plane VM down before the Mac restarts or updates:
+# verified etcd snapshot (shipped off-host by the unit itself), then a guest
+# poweroff, then a wait for UTM to report the VM stopped.
+#
+#   cluster-shutdown [--cordon] [--proceed-on-backup-failure]
+#
+#   --cordon                      also cordon every node first and mark it, so
+#                                 cluster-startup uncordons exactly those nodes
+#   --proceed-on-backup-failure   power off even if the snapshot failed. Only
+#                                 the launchd shutdown hook passes this: the Mac
+#                                 is going down regardless, and a clean poweroff
+#                                 beats the VM being killed mid-write.
+set -uo pipefail
+
+UTMCTL="{{ utmctl_bin }}"
+VM="{{ utm_vm_name }}"
+CP="{{ cluster_cp_user }}@{{ cluster_cp_host }}"
+KUBECONFIG_PATH="{{ cluster_cp_kubeconfig }}"
+ANNOTATION="{{ cluster_cordon_annotation }}"
+TIMEOUT={{ vm_shutdown_timeout }}
+
+CORDON=0
+PROCEED=0
+for arg in "$@"; do
+  case "$arg" in
+    --cordon) CORDON=1 ;;
+    --proceed-on-backup-failure) PROCEED=1 ;;
+    *) echo "usage: cluster-shutdown [--cordon] [--proceed-on-backup-failure]" >&2; exit 2 ;;
+  esac
+done
+
+log() { echo "[cluster-shutdown] $(date '+%F %T') $*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$CP")
+
+vm_state() { "$UTMCTL" status "$VM" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
+vm_stopped() { case "$(vm_state)" in *stopped*) return 0 ;; *) return 1 ;; esac; }
+
+if vm_stopped; then
+  log "VM '$VM' is already stopped; nothing to do"
+  exit 0
+fi
+
+if "${SSH[@]}" true 2>/dev/null; then
+  if [ "$CORDON" -eq 1 ]; then
+    log "cordoning nodes and marking them with $ANNOTATION"
+    "${SSH[@]}" sudo bash -s <<EOF || log "WARNING: cordon failed; continuing"
+export KUBECONFIG="$KUBECONFIG_PATH"
+for node in \$(kubectl get nodes -o name); do
+  kubectl cordon "\$node"
+  kubectl annotate "\$node" "$ANNOTATION=cluster-shutdown" --overwrite
+done
+EOF
+  fi
+
+  log "taking a verified etcd snapshot (ships off-host)"
+  if ! "${SSH[@]}" sudo systemctl start etcd-snapshot.service; then
+    if [ "$PROCEED" -eq 1 ]; then
+      log "WARNING: snapshot failed; powering off anyway (--proceed-on-backup-failure)"
+    else
+      die "snapshot failed, NOT shutting down. Check: ssh $CP sudo journalctl -u etcd-snapshot.service -n 30. Re-run with --proceed-on-backup-failure to skip the backup."
+    fi
+  fi
+
+  log "powering off the guest"
+  "${SSH[@]}" sudo systemctl poweroff 2>/dev/null || true
+else
+  log "WARNING: cannot SSH to $CP; asking UTM for a graceful stop instead"
+  if "$UTMCTL" help stop 2>&1 | grep -q -- '--request'; then
+    "$UTMCTL" stop "$VM" --request || true
+  else
+    die "cannot reach the guest and this utmctl has no --request stop; refusing to force-stop the VM"
+  fi
+fi
+
+log "waiting up to ${TIMEOUT}s for UTM to report '$VM' stopped"
+waited=0
+while ! vm_stopped; do
+  if [ "$waited" -ge "$TIMEOUT" ]; then
+    die "VM still not stopped after ${TIMEOUT}s (state: $(vm_state)). Not force-killing; investigate in UTM."
+  fi
+  sleep 3
+  waited=$((waited + 3))
+done
+log "VM '$VM' is stopped"

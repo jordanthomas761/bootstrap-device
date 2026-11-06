@@ -768,6 +768,47 @@ tracked in the issue:
   built-in API-key auth, and access is currently scoped cluster-side by
   NetworkPolicy in `homelab-infra`.
 
+## Control-Plane VM Lifecycle (UTM host)
+
+The control plane is a UTM VM, so every macOS update or restart of its host
+takes the whole cluster's API down. `playbooks/vm-host-lifecycle.yml` makes that
+a non-event by installing, on the Mac that runs the VM, three scripts and two
+per-user launchd agents:
+
+| Piece | When | What it does |
+|---|---|---|
+| `cluster-shutdown-hook` agent | idles from login; fires on SIGTERM (logout, restart, shutdown, a macOS update's reboot) | runs `cluster-shutdown --cordon --proceed-on-backup-failure` |
+| `cluster-shutdown` | by hand, or from the hook | cordons nodes (marking them), takes a verified etcd snapshot that ships off-host, powers the guest off, waits for UTM to report it stopped |
+| `cluster-startup` agent | at login | opens UTM, starts the VM, waits for SSH and the API server, uncordons only the nodes `cluster-shutdown` marked |
+
+```bash
+# 1. Put the Mac in the vm_host group (inventory/hosts.yml) and set utm_vm_name
+#    in inventory/group_vars/vm_host.yml -- `utmctl list` prints the name.
+# 2. Install:
+ansible-playbook -i inventory/hosts.yml playbooks/vm-host-lifecycle.yml
+```
+
+The Mac's SSH key must be accepted by the control-plane user, which needs
+passwordless sudo (`playbooks/passwordless-sudo.yml`). Logs are in
+`~/Library/Logs/cluster-vm/`.
+
+### What it cannot promise
+
+- **Login, not boot.** `utmctl` drives the UTM GUI, which only exists in a
+  logged-in session, so these are LaunchAgents. A Mac that reboots to the login
+  window starts nothing until someone logs in. Enable automatic login for an
+  unattended start.
+- **The shutdown hook is best effort.** launchd honours `ExitTimeOut` (raised
+  from its 20s default), but macOS can cut a real system shutdown shorter. When
+  it does, the 6-hourly etcd snapshot timer is the backstop: the worst case is a
+  backup up to six hours old, not a lost cluster. Run `cluster-shutdown` by hand
+  before a planned restart when you want the guarantee.
+- **No Longhorn handling.** Scale down workloads using Longhorn volumes first if
+  the Mac will be away for long; the scripts do not detach volumes.
+- **utmctl details are inferred.** Its `stop` flags and `status` strings are not
+  fully documented, so the scripts match `stopped`/`started` loosely and only
+  use `stop --request` after confirming this `utmctl` lists it.
+
 ## What Gets Configured
 
 ### System Setup
@@ -818,6 +859,7 @@ tracked in the issue:
     ├── oh-my-zsh.yml            # ZSH shell setup
     ├── machine-learning.yml      # ML tools and libraries
     ├── mlx-inference.yml         # mlx-openai-server on pi.dev as a launchd daemon (run on demand, not via main.yml)
+    ├── vm-host-lifecycle.yml     # Installs cluster-shutdown / cluster-startup + launchd agents on the UTM host Mac (run on demand, not via main.yml)
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)
     ├── etcd-snapshot-backup.yml  # Installs the verified-snapshot systemd timer (safe to run, no API outage)

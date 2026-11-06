@@ -1,0 +1,27 @@
+#!/bin/bash
+# Managed by playbooks/vm-host-lifecycle.yml — do not hand-edit.
+#
+# Idles until launchd sends SIGTERM (logout, restart, shutdown, or a macOS
+# update's reboot), then runs cluster-shutdown. launchd waits ExitTimeOut
+# seconds for this to finish before SIGKILL; the plist raises it well above
+# launchd's 20s default. macOS can still cut a real system shutdown short, so
+# the 6-hourly etcd snapshot timer remains the backstop.
+set -u
+
+SHUTDOWN="{{ vm_lifecycle_bin_dir }}/cluster-shutdown"
+
+log() { echo "[cluster-shutdown-hook] $(date '+%F %T') $*"; }
+
+on_term() {
+  log "received stop signal; shutting the control-plane VM down cleanly"
+  "$SHUTDOWN" --cordon --proceed-on-backup-failure
+  log "finished (exit $?)"
+  exit 0
+}
+trap on_term TERM INT HUP
+
+log "armed"
+while true; do
+  sleep 3600 &
+  wait $!
+done

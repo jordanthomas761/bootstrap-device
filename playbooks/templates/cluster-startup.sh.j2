@@ -1,0 +1,66 @@
+#!/bin/bash
+# Managed by playbooks/vm-host-lifecycle.yml — do not hand-edit.
+#
+# Brings the control-plane VM up after the Mac boots or you log in: start UTM
+# and the VM, wait for SSH and the API server, then uncordon only the nodes that
+# cluster-shutdown cordoned. Safe to run any time; every step is idempotent.
+set -uo pipefail
+
+UTMCTL="{{ utmctl_bin }}"
+UTM_APP="{{ utm_app }}"
+VM="{{ utm_vm_name }}"
+CP="{{ cluster_cp_user }}@{{ cluster_cp_host }}"
+KUBECONFIG_PATH="{{ cluster_cp_kubeconfig }}"
+ANNOTATION="{{ cluster_cordon_annotation }}"
+TIMEOUT={{ vm_startup_timeout }}
+
+log() { echo "[cluster-startup] $(date '+%F %T') $*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$CP")
+
+vm_state() { "$UTMCTL" status "$VM" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
+
+# Retry helper: wait_for "<what>" <command...>, bounded by the shared timeout.
+deadline=$((SECONDS + TIMEOUT))
+wait_for() {
+  local what="$1"
+  shift
+  until "$@" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || die "timed out waiting for $what"
+    sleep 5
+  done
+  log "$what: ready"
+}
+
+# utmctl drives the UTM app, which has to be running in this login session.
+if ! pgrep -x UTM >/dev/null 2>&1; then
+  log "launching UTM"
+  open -g -a "$UTM_APP" || die "could not open $UTM_APP"
+  sleep 5
+fi
+
+case "$(vm_state)" in
+  *started*|*starting*)
+    log "VM '$VM' is already running" ;;
+  *)
+    log "starting VM '$VM'"
+    "$UTMCTL" start "$VM" || die "utmctl start failed (is the name right? try: $UTMCTL list)" ;;
+esac
+
+wait_for "SSH to $CP" "${SSH[@]}" true
+wait_for "the API server" "${SSH[@]}" sudo kubectl --kubeconfig "$KUBECONFIG_PATH" get --raw /readyz
+
+log "uncordoning nodes that cluster-shutdown cordoned"
+"${SSH[@]}" sudo bash -s <<EOF
+export KUBECONFIG="$KUBECONFIG_PATH"
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.{{ cluster_cordon_annotation | replace('.', '\\.') }}}{"\n"}{end}' |
+while IFS=\$'\t' read -r node marker; do
+  if [ "\$marker" = "cluster-shutdown" ]; then
+    kubectl uncordon "\$node"
+    kubectl annotate node "\$node" "$ANNOTATION-"
+  fi
+done
+kubectl get nodes
+EOF
+log "done"
