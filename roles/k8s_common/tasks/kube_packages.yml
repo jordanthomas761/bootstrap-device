@@ -112,6 +112,35 @@
     state: present
     allow_downgrade: true
 
+# cri-tools (crictl) and kubernetes-cni arrive as automatic dependencies of
+# kubeadm/kubelet. That is fine until an OS release upgrade: do-release-upgrade
+# disables third-party sources, then lists every package from them as
+# "Obsolete" and purges the ones marked automatic. This happened on the
+# 24.04 -> 26.04 control-plane upgrade (2026-11-06): the holds kept kubeadm,
+# kubelet and kubectl, but cri-tools was purged ("MarkPurge cri-tools ...
+# FU=1" in /var/log/dist-upgrade/apt.log), which silently broke
+# etcd-snapshot.sh, since it finds etcd via crictl.
+#
+# Marking them manual is the fix. Not held: kubeadm of the next minor can
+# require a newer cri-tools, and a hold would block that install mid-upgrade.
+- name: Install cri-tools and kubernetes-cni explicitly
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.apt:
+    name:
+      - cri-tools
+      - kubernetes-cni
+    state: present
+
+# apt does not change the auto/manual mark of a package that is already
+# installed, so the task above alone leaves an existing node exposed.
+- name: Mark cri-tools and kubernetes-cni as manually installed
+  become: true
+  become_method: ansible.builtin.sudo
+  ansible.builtin.command: apt-mark manual cri-tools kubernetes-cni
+  register: k8s_common_apt_mark_manual
+  changed_when: "' set to manually installed' in k8s_common_apt_mark_manual.stdout"
+
 - name: Hold kubelet, kubeadm, and kubectl at the pinned version
   become: true
   become_method: ansible.builtin.sudo

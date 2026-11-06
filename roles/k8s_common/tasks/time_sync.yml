@@ -1,21 +1,38 @@
 ---
-- name: Ensure systemd-timesyncd is installed
-  become: true
-  become_method: ansible.builtin.sudo
-  ansible.builtin.apt:
-    name: systemd-timesyncd
-    state: present
+# Ubuntu 26.04 installs chrony instead of systemd-timesyncd on fresh installs
+# (a 24.04 -> 26.04 release upgrade keeps timesyncd). The two conflict as
+# time-daemon providers, so installing timesyncd on a chrony host would remove
+# chrony. Use whichever the host already has; timesyncd stays the default for
+# everything else (the Debian workers, upgraded Ubuntu).
+- name: Gather package facts for time sync
+  ansible.builtin.package_facts:
+    manager: apt
 
-- name: Ensure systemd-timesyncd is enabled and running
+- name: Ensure chrony is enabled and running
   become: true
   become_method: ansible.builtin.sudo
   ansible.builtin.systemd:
-    name: systemd-timesyncd
+    name: chrony
     enabled: true
     state: started
+  when: "'chrony' in ansible_facts.packages"
 
-- name: Ensure NTP sync is enabled
+- name: Use systemd-timesyncd
+  when: "'chrony' not in ansible_facts.packages"
   become: true
   become_method: ansible.builtin.sudo
-  ansible.builtin.command: timedatectl set-ntp true
-  changed_when: false
+  block:
+    - name: Ensure systemd-timesyncd is installed
+      ansible.builtin.apt:
+        name: systemd-timesyncd
+        state: present
+
+    - name: Ensure systemd-timesyncd is enabled and running
+      ansible.builtin.systemd:
+        name: systemd-timesyncd
+        enabled: true
+        state: started
+
+    - name: Ensure NTP sync is enabled
+      ansible.builtin.command: timedatectl set-ntp true
+      changed_when: false

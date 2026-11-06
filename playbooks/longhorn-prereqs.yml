@@ -143,9 +143,9 @@
         state: restarted
 
 # Longhorn schedules storage only where it finds a labelled node. The control
-# plane is deliberately left out: it has ~1 GB of available RAM and 19 GB of
-# disk against 400-860 GB of SSD on the two Pis, so putting replicas there
-# would fill it and starve the API server. Labelling is done from the control
+# plane is deliberately left out: it is a 7 GB VM on a 64 GB virtual disk,
+# against 400-860 GB of SSD on the two Pis, so putting replicas there would
+# fill the disk that etcd and the API server depend on. Labelling is done from the control
 # plane because it is the host with a kubeconfig.
 - name: Label the storage nodes for Longhorn
   hosts: control_plane
