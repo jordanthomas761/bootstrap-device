@@ -1,0 +1,145 @@
+# Gives the UTM host Mac least-privilege remote control of the control plane,
+# for the lifecycle scripts installed by playbooks/vm-host-lifecycle.yml.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/vm-ctl-access.yml
+#
+# Run it BEFORE vm-host-lifecycle.yml, and without --limit: the first play makes
+# a key on the Mac and the second authorizes it on the control plane.
+#
+# WHY NOT JUST AUTHORIZE THE ADMIN LOGIN
+#
+# The scripts need a few things from the control plane: take an etcd snapshot,
+# power the guest off, cordon and uncordon nodes, ask whether the API is ready.
+# Handing the Mac the admin account for that means anyone who gets into the Mac
+# has passwordless root on the control plane.
+#
+# WHAT THIS DOES INSTEAD
+#
+#   - a vm-ctl user: locked password, no shell access, nothing but its key.
+#   - the key is restricted with `restrict,command=...`: no pty, no forwarding,
+#     and sshd runs ONE script (vm-ctl-ssh) whatever the client asks for. That
+#     script compares the requested command, as a whole string, to a fixed list
+#     of verbs (vm_ctl_verbs in group_vars/all.yml) and refuses anything else.
+#   - each verb is one fixed action in a root-owned script (vm-ctl-root), and
+#     /etc/sudoers.d/90-vm-ctl lets vm-ctl run exactly that script with exactly
+#     those verbs. No `sudo kubectl`, no admin kubeconfig access beyond what the
+#     verbs do.
+#   - authorized_keys and ~/.ssh are root-owned, so vm-ctl cannot edit its own
+#     restrictions.
+#
+# WORST CASE with the Mac's key stolen: someone can power off or cordon the
+# control plane (an outage), not read Secrets or change workloads.
+#
+# Same pattern as playbooks/claude-readonly-access.yml's claude-ro user.
+- name: Generate the vm-ctl key on the UTM host
+  hosts: vm_host
+
+  tasks:
+    - name: Ensure ~/.ssh exists
+      ansible.builtin.file:
+        path: "{{ vm_host_home }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Generate a dedicated ed25519 key (kept if it already exists)
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -t
+          - ed25519
+          - -N
+          - ""
+          - -C
+          - "vm-ctl@{{ inventory_hostname }}"
+          - -f
+          - "{{ vm_ctl_key }}"
+      args:
+        creates: "{{ vm_ctl_key }}"
+
+    - name: Read the public key
+      ansible.builtin.slurp:
+        src: "{{ vm_ctl_key }}.pub"
+      register: vm_ctl_access_pubkey
+
+    - name: Remember it for the control-plane play
+      ansible.builtin.set_fact:
+        vm_ctl_pubkey: "{{ (vm_ctl_access_pubkey.content | b64decode) | trim }}"
+
+- name: Create the restricted vm-ctl user on the control plane
+  hosts: control_plane
+  become: true
+  become_method: ansible.builtin.sudo
+
+  tasks:
+    - name: Require a UTM host to have generated a key
+      ansible.builtin.assert:
+        that:
+          - groups['vm_host'] | default([]) | length > 0
+          - hostvars[groups['vm_host'][0]].vm_ctl_pubkey is defined
+        fail_msg: >-
+          No vm-ctl public key is available. Add the Mac to the vm_host group in
+          inventory/hosts.yml and run this playbook without --limit, so the first
+          play generates the key before this one authorizes it.
+
+    - name: Create the vm-ctl user (no usable password)
+      ansible.builtin.user:
+        name: "{{ vm_ctl_user }}"
+        comment: "Restricted remote control for the UTM host"
+        shell: /bin/bash
+        # "*" never matches a password but, unlike a "!"-locked account, still
+        # lets sshd accept the key.
+        password: "*"
+        create_home: true
+
+    - name: Install the root-run verbs
+      ansible.builtin.template:
+        src: templates/vm-ctl-root.sh.j2
+        dest: "{{ vm_ctl_root_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the sshd forced command
+      ansible.builtin.template:
+        src: templates/vm-ctl-ssh.sh.j2
+        dest: "{{ vm_ctl_ssh_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Allow vm-ctl to run exactly the verbs through sudo
+      ansible.builtin.template:
+        src: templates/vm-ctl-sudoers.j2
+        dest: "/etc/sudoers.d/90-{{ vm_ctl_user }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    # Root-owned on purpose: sshd's StrictModes accepts that, and it means the
+    # vm-ctl user cannot loosen its own key restrictions.
+    - name: Create a root-owned ~/.ssh for vm-ctl
+      ansible.builtin.file:
+        path: "/home/{{ vm_ctl_user }}/.ssh"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Authorize the Mac's key, restricted to the forced command
+      ansible.builtin.copy:
+        dest: "/home/{{ vm_ctl_user }}/.ssh/authorized_keys"
+        content: >-
+          restrict,command="{{ vm_ctl_ssh_bin }}"
+          {{ hostvars[groups['vm_host'][0]].vm_ctl_pubkey }}
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Say how to test it
+      ansible.builtin.debug:
+        msg: >-
+          From the Mac: ssh -i {{ hostvars[groups['vm_host'][0]].vm_ctl_key }}
+          -o IdentitiesOnly=yes {{ vm_ctl_user }}@{{ ansible_host }} ping
+          should print "ok". Anything outside {{ vm_ctl_verbs | join(', ') }}
+          is refused.

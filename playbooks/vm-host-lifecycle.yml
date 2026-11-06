@@ -26,8 +26,9 @@
 #
 #   - the Mac under the vm_host group in inventory/hosts.yml
 #   - utm_vm_name in inventory/group_vars/vm_host.yml (see `utmctl list`)
-#   - an SSH key on that Mac that the control-plane user accepts, and
-#     passwordless sudo there (playbooks/passwordless-sudo.yml)
+#   - playbooks/vm-ctl-access.yml run first: it makes the Mac's key and a
+#     restricted vm-ctl user on the control plane that can run only a fixed set
+#     of verbs (no admin login or sudo involved)
 #
 # LIMITS, SO THEY ARE NOT A SURPRISE
 #

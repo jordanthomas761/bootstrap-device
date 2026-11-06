@@ -9,15 +9,17 @@ set -uo pipefail
 UTMCTL="{{ utmctl_bin }}"
 UTM_APP="{{ utm_app }}"
 VM="{{ utm_vm_name }}"
-CP="{{ cluster_cp_user }}@{{ cluster_cp_host }}"
-KUBECONFIG_PATH="{{ cluster_cp_kubeconfig }}"
-ANNOTATION="{{ cluster_cordon_annotation }}"
+CP="{{ vm_ctl_user }}@{{ cluster_cp_host }}"
+KEY="{{ vm_ctl_key }}"
 TIMEOUT={{ vm_startup_timeout }}
 
 log() { echo "[cluster-startup] $(date '+%F %T') $*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$CP")
+# vm-ctl can run only fixed verbs (ping, ready, uncordon, ...); see
+# playbooks/vm-ctl-access.yml. There is no shell on the other end.
+SSH=(ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+  -o StrictHostKeyChecking=accept-new "$CP")
 
 vm_state() { "$UTMCTL" status "$VM" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
 
@@ -60,19 +62,9 @@ case "$(vm_state)" in
     "$UTMCTL" start "$VM" || die "utmctl start failed (is the name right? try: $UTMCTL list)" ;;
 esac
 
-wait_for "SSH to $CP" "${SSH[@]}" true
-wait_for "the API server" "${SSH[@]}" sudo kubectl --kubeconfig "$KUBECONFIG_PATH" get --raw /readyz
+wait_for "SSH to $CP" "${SSH[@]}" ping
+wait_for "the API server" "${SSH[@]}" ready
 
 log "uncordoning nodes that cluster-shutdown cordoned"
-"${SSH[@]}" sudo bash -s <<EOF
-export KUBECONFIG="$KUBECONFIG_PATH"
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.{{ cluster_cordon_annotation | replace('.', '\\.') }}}{"\n"}{end}' |
-while IFS=\$'\t' read -r node marker; do
-  if [ "\$marker" = "cluster-shutdown" ]; then
-    kubectl uncordon "\$node"
-    kubectl annotate node "\$node" "$ANNOTATION-"
-  fi
-done
-kubectl get nodes
-EOF
+"${SSH[@]}" uncordon
 log "done"

@@ -99,3 +99,18 @@ kubelet_reservations:
 # would trade a host-vs-host mismatch for a host-vs-pod one, which is harder to
 # notice.
 node_timezone: Etc/UTC
+
+# Least-privilege remote control of the control plane by the UTM host's lifecycle
+# scripts (playbooks/vm-ctl-access.yml, playbooks/vm-host-lifecycle.yml).
+#
+# The Mac's key logs in as this user, can run ONLY the verbs below (an sshd
+# forced command), and each verb maps to one fixed root-owned action. It does not
+# get a shell, sudo kubectl, or the admin login.
+vm_ctl_user: vm-ctl
+vm_ctl_verbs: [ping, snapshot, poweroff, ready, nodes, cordon, uncordon]
+vm_ctl_root_bin: /usr/local/sbin/vm-ctl-root
+vm_ctl_ssh_bin: /usr/local/sbin/vm-ctl-ssh
+vm_ctl_kubeconfig: /etc/kubernetes/admin.conf
+# Marks nodes that `cordon` cordoned, so `uncordon` releases only those and never
+# a node you cordoned by hand for another reason.
+cluster_cordon_annotation: homelab.local/cordoned-by

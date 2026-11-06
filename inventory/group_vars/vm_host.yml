@@ -16,13 +16,11 @@ vm_host_home: "/Users/{{ vm_host_user }}"
 utm_app: /Applications/UTM.app
 utmctl_bin: "{{ utm_app }}/Contents/MacOS/utmctl"
 
-# How the scripts reach the control plane. They SSH to it as this user and run
-# kubectl with the kubeadm admin kubeconfig under sudo, so no kubeconfig has to
-# live on the Mac. The user needs passwordless sudo (playbooks/passwordless-sudo.yml)
-# and the Mac's key in its authorized_keys.
+# How the scripts reach the control plane: as the restricted vm-ctl user with a
+# dedicated key generated on this Mac by playbooks/vm-ctl-access.yml. The verbs it
+# may run, and why it is not the admin login, are in inventory/group_vars/all.yml.
 cluster_cp_host: "{{ hostvars['k8s-cp'].ansible_host }}"
-cluster_cp_user: "{{ hostvars['k8s-cp'].ansible_user | default(vm_host_user) }}"
-cluster_cp_kubeconfig: /etc/kubernetes/admin.conf
+vm_ctl_key: "{{ vm_host_home }}/.ssh/id_ed25519_vm_ctl"
 
 # Where the scripts, plists and logs go. All under the login user's home, so
 # nothing here needs root.
@@ -30,10 +28,6 @@ vm_lifecycle_bin_dir: "{{ vm_host_home }}/.local/bin"
 vm_lifecycle_log_dir: "{{ vm_host_home }}/Library/Logs/cluster-vm"
 vm_lifecycle_agents_dir: "{{ vm_host_home }}/Library/LaunchAgents"
 vm_lifecycle_label_prefix: local.homelab.cluster-vm
-
-# Marks nodes that cluster-shutdown cordoned, so cluster-startup uncordons only
-# those and never a node you cordoned by hand for another reason.
-cluster_cordon_annotation: homelab.local/cordoned-by
 
 # Seconds. Shutdown: the snapshot (~10s) plus the guest powering off. Startup:
 # VM boot plus kubeadm's static pods coming back, which is slow on a small VM.

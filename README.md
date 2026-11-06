@@ -784,13 +784,35 @@ per-user launchd agents:
 ```bash
 # 1. Put the Mac in the vm_host group (inventory/hosts.yml) and set utm_vm_name
 #    in inventory/group_vars/vm_host.yml -- `utmctl list` prints the name.
-# 2. Install:
+# 2. Give the Mac least-privilege access to the control plane (run without --limit):
+ansible-playbook -i inventory/hosts.yml playbooks/vm-ctl-access.yml
+# 3. Install the scripts and agents:
 ansible-playbook -i inventory/hosts.yml playbooks/vm-host-lifecycle.yml
 ```
 
-The Mac's SSH key must be accepted by the control-plane user, which needs
-passwordless sudo (`playbooks/passwordless-sudo.yml`). Logs are in
-`~/Library/Logs/cluster-vm/`.
+Logs are in `~/Library/Logs/cluster-vm/`.
+
+### Why a separate `vm-ctl` user
+
+The scripts need four things from the control plane: take an etcd snapshot, power
+the guest off, cordon/uncordon nodes, and ask whether the API is ready. Giving the
+Mac the admin login would make anyone who gets into the Mac a root user on the
+control plane, so `playbooks/vm-ctl-access.yml` does this instead:
+
+- `vm-ctl` has no usable password, and its key is restricted with
+  `restrict,command=…`: no pty, no forwarding, and sshd runs one script whatever
+  the client asks for. That script compares the requested command, as a whole
+  string, to a fixed list (`vm_ctl_verbs` in `group_vars/all.yml`): `ping`,
+  `snapshot`, `poweroff`, `ready`, `nodes`, `cordon`, `uncordon`.
+- Each verb is one fixed action in a root-owned script, and
+  `/etc/sudoers.d/90-vm-ctl` lets `vm-ctl` run exactly that script with exactly
+  those verbs. There is no `sudo kubectl`.
+- `authorized_keys` is root-owned, so `vm-ctl` cannot loosen its own limits.
+- With the Mac's key stolen, the worst case is an outage (power off or cordon the
+  control plane), not reading Secrets or changing workloads.
+
+To add a verb, add it to `vm_ctl_verbs`, give it a branch in
+`playbooks/templates/vm-ctl-root.sh.j2`, and re-run `vm-ctl-access.yml`.
 
 ### What it cannot promise
 
@@ -868,6 +890,7 @@ passwordless sudo (`playbooks/passwordless-sudo.yml`). Logs are in
     ├── oh-my-zsh.yml            # ZSH shell setup
     ├── machine-learning.yml      # ML tools and libraries
     ├── mlx-inference.yml         # mlx-openai-server on pi.dev as a launchd daemon (run on demand, not via main.yml)
+    ├── vm-ctl-access.yml         # Restricted vm-ctl user on the control plane (fixed verbs only) + the UTM host's key; run before vm-host-lifecycle.yml
     ├── vm-host-lifecycle.yml     # Installs cluster-shutdown / cluster-startup + launchd agents on the UTM host Mac (run on demand, not via main.yml)
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)

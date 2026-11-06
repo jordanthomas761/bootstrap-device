@@ -1,0 +1,44 @@
+#!/bin/bash
+# Managed by playbooks/vm-ctl-access.yml — do not hand-edit.
+#
+# The only thing the vm-ctl user may run as root (see /etc/sudoers.d/90-vm-ctl,
+# which lists each verb exactly). Every verb is one fixed action; nothing here
+# takes an argument beyond the verb, so a stolen key can power the control plane
+# off or cordon it, but cannot read Secrets or change workloads.
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+export KUBECONFIG="{{ vm_ctl_kubeconfig }}"
+ANNOTATION="{{ cluster_cordon_annotation }}"
+MARKER="cluster-shutdown"
+
+case "${1:-}" in
+  ping)
+    echo ok ;;
+  snapshot)
+    # Type=oneshot: returns when the verified snapshot has been taken and shipped.
+    systemctl start etcd-snapshot.service ;;
+  poweroff)
+    systemctl poweroff ;;
+  ready)
+    kubectl get --raw /readyz ;;
+  nodes)
+    kubectl get nodes -o wide ;;
+  cordon)
+    for node in $(kubectl get nodes -o name); do
+      kubectl cordon "$node"
+      kubectl annotate "$node" "$ANNOTATION=$MARKER" --overwrite
+    done ;;
+  uncordon)
+    kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.{{ cluster_cordon_annotation | replace('.', '\\.') }}}{"\n"}{end}' |
+    while IFS=$'\t' read -r node marker; do
+      if [ "$marker" = "$MARKER" ]; then
+        kubectl uncordon "$node"
+        kubectl annotate node "$node" "$ANNOTATION-"
+      fi
+    done
+    kubectl get nodes ;;
+  *)
+    echo "usage: vm-ctl-root {{ vm_ctl_verbs | join('|') }}" >&2
+    exit 2 ;;
+esac

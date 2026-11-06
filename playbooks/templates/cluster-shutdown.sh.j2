@@ -17,9 +17,8 @@ set -uo pipefail
 
 UTMCTL="{{ utmctl_bin }}"
 VM="{{ utm_vm_name }}"
-CP="{{ cluster_cp_user }}@{{ cluster_cp_host }}"
-KUBECONFIG_PATH="{{ cluster_cp_kubeconfig }}"
-ANNOTATION="{{ cluster_cordon_annotation }}"
+CP="{{ vm_ctl_user }}@{{ cluster_cp_host }}"
+KEY="{{ vm_ctl_key }}"
 TIMEOUT={{ vm_shutdown_timeout }}
 
 ARGS_FILE="{{ vm_lifecycle_log_dir }}/.shutdown-args"
@@ -50,7 +49,10 @@ done
 log() { echo "[cluster-shutdown] $(date '+%F %T') $*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$CP")
+# The vm-ctl account can run only fixed verbs (ping, snapshot, poweroff, cordon,
+# ...); see playbooks/vm-ctl-access.yml. There is no shell on the other end.
+SSH=(ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=accept-new "$CP")
 
 vm_state() { "$UTMCTL" status "$VM" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
 vm_stopped() { case "$(vm_state)" in *stopped*) return 0 ;; *) return 1 ;; esac; }
@@ -60,31 +62,25 @@ if vm_stopped; then
   exit 0
 fi
 
-if "${SSH[@]}" true 2>/dev/null; then
+if "${SSH[@]}" ping >/dev/null 2>&1; then
   if [ "$CORDON" -eq 1 ]; then
-    log "cordoning nodes and marking them with $ANNOTATION"
-    "${SSH[@]}" sudo bash -s <<EOF || log "WARNING: cordon failed; continuing"
-export KUBECONFIG="$KUBECONFIG_PATH"
-for node in \$(kubectl get nodes -o name); do
-  kubectl cordon "\$node"
-  kubectl annotate "\$node" "$ANNOTATION=cluster-shutdown" --overwrite
-done
-EOF
+    log "cordoning nodes and marking them"
+    "${SSH[@]}" cordon || log "WARNING: cordon failed; continuing"
   fi
 
   log "taking a verified etcd snapshot (ships off-host)"
-  if ! "${SSH[@]}" sudo systemctl start etcd-snapshot.service; then
+  if ! "${SSH[@]}" snapshot; then
     if [ "$PROCEED" -eq 1 ]; then
       log "WARNING: snapshot failed; powering off anyway (--proceed-on-backup-failure)"
     else
-      die "snapshot failed, NOT shutting down. Check: ssh $CP sudo journalctl -u etcd-snapshot.service -n 30. Re-run with --proceed-on-backup-failure to skip the backup."
+      die "snapshot failed, NOT shutting down. On the control plane: sudo journalctl -u etcd-snapshot.service -n 30. Re-run with --proceed-on-backup-failure to skip the backup."
     fi
   fi
 
   log "powering off the guest"
-  "${SSH[@]}" sudo systemctl poweroff 2>/dev/null || true
+  "${SSH[@]}" poweroff 2>/dev/null || true
 else
-  log "WARNING: cannot SSH to $CP; asking UTM for a graceful stop instead"
+  log "WARNING: cannot reach $CP as vm-ctl; asking UTM for a graceful stop instead"
   if "$UTMCTL" help stop 2>&1 | grep -q -- '--request'; then
     "$UTMCTL" stop "$VM" --request || true
   else
