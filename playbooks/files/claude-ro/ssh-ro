@@ -1,0 +1,14 @@
+#!/bin/bash
+# Read-only SSH for Claude Code: only to the claude-ro aliases created by
+# bootstrap-device/playbooks/claude-readonly-access.yml, with no ssh options.
+#   ssh-ro <cp-ro|gpio-ro|ml-ro> <remote command...>
+set -euo pipefail
+case "${1:-}" in
+  cp-ro|gpio-ro|ml-ro) host=$1; shift ;;
+  *) echo "ssh-ro: host must be cp-ro, gpio-ro or ml-ro" >&2; exit 2 ;;
+esac
+[ $# -gt 0 ] || { echo "ssh-ro: a remote command is required" >&2; exit 2; }
+# `--` ends option parsing, so nothing after the host can become an ssh
+# option (OpenSSH otherwise accepts e.g. -o ProxyCommand=... after the host).
+# BatchMode: never prompt. -T: no pty (the key's `restrict` refuses one anyway).
+exec /usr/bin/ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -- "$host" "$*"
