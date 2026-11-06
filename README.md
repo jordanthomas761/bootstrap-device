@@ -796,8 +796,11 @@ passwordless sudo (`playbooks/passwordless-sudo.yml`). Logs are in
 
 - **Login, not boot.** `utmctl` drives the UTM GUI, which only exists in a
   logged-in session, so these are LaunchAgents. A Mac that reboots to the login
-  window starts nothing until someone logs in. Enable automatic login for an
-  unattended start.
+  window starts nothing until someone logs in. macOS does not offer automatic
+  login while FileVault is on, and FileVault also holds the Mac at its pre-boot
+  unlock screen after any restart, so with FileVault on a restart needs a person
+  at the keyboard whatever runs here. See the headless-runner issue for the
+  options.
 - **`utmctl` crashes over SSH.** It drives UTM through Apple Events, so it only
   works inside the logged-in GUI session. `cluster-shutdown` and
   `cluster-startup` detect a non-GUI shell and hand the work to a launchd agent

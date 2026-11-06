@@ -33,7 +33,8 @@
 #
 #   - These are LaunchAgents, because utmctl drives the UTM GUI app and needs a
 #     logged-in session. A Mac that reboots to the login window starts nothing
-#     until someone logs in; enable automatic login if you want it unattended.
+#     until someone logs in. Automatic login is not available with FileVault
+#     on, which also stops the Mac at its pre-boot unlock screen after a restart.
 #   - The shutdown hook is best effort. launchd honours ExitTimeOut, but macOS
 #     can cut a system shutdown short. The 6-hourly etcd snapshot timer is the
 #     backstop, and cluster-shutdown by hand is the guaranteed path.
