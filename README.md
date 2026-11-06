@@ -894,22 +894,34 @@ ansible-playbook -i inventory/hosts.yml playbooks/vm-runner.yml -K
 ansible-playbook -i inventory/hosts.yml playbooks/vm-ctl-access.yml
 ```
 
-Then the cutover, by hand, with the cluster quiet:
+Then the cutover, by hand, with the cluster quiet. **Clone from whichever disk the
+live control plane is using, not from UTM's folder by default**: if the VM has
+been running under hand-started QEMU (the spike), UTM's copy is hours or days
+stale, and cloning it would throw that state away.
 
-1. Take an etcd snapshot and stop the UTM VM (`ssh … 'sudo systemctl start etcd-snapshot.service && sudo systemctl poweroff'`). Confirm
-   nothing is running: `pgrep -fl qemu`.
-2. Clone the VM files into the runner's directory (instant on APFS, no extra
-   space). The disk and EFI file are in UTM's `…/control-plane.utm/Data/`, and
-   the firmware is UTM's own copy, so it matches the existing EFI variables:
+1. Take an etcd snapshot (`ssh … 'sudo systemctl start etcd-snapshot.service'`)
+   and stop the live VM cleanly, then confirm nothing is running
+   (`pgrep -fl qemu`). Under hand-started QEMU, press its virtual power button
+   and wait for the process to exit; under UTM, `sudo poweroff` in the guest:
    ```bash
-   UTM=~/Library/Containers/com.utmapp.UTM/Data
+   printf '{"execute":"qmp_capabilities"}\n{"execute":"system_powerdown"}\n' | nc -U ~/vm-spike/qmp.sock
+   ```
+2. Clone the VM files into the runner's directory (instant on APFS, no extra
+   space), from the directory the live VM used. `SRC` is `~/vm-spike` for the
+   hand-started QEMU, whose firmware copy already matches its EFI variables:
+   ```bash
+   SRC=~/vm-spike
    D=/var/vm/controlplane
-   sudo cp -c "$UTM"/Documents/control-plane.utm/Data/*.qcow2 "$D/disk.qcow2"
-   sudo cp -c "$UTM"/Documents/control-plane.utm/Data/efi_vars.fd "$D/efi_vars.fd"
-   sudo cp -c "$UTM"/Library/Caches/qemu/edk2-aarch64-code.fd "$D/"
+   sudo cp -c "$SRC/control-plane.qcow2" "$D/disk.qcow2"
+   sudo cp -c "$SRC/efi_vars.fd" "$D/efi_vars.fd"
+   sudo cp -c "$SRC/edk2-aarch64-code.fd" "$D/"
    sudo chown _vmrunner:staff "$D"/disk.qcow2 "$D"/efi_vars.fd "$D"/edk2-aarch64-code.fd
    sudo chmod 0600 "$D"/disk.qcow2 "$D"/efi_vars.fd
    ```
+   Only if the UTM VM was the live one, use its files instead:
+   `…/Documents/control-plane.utm/Data/*.qcow2` and `efi_vars.fd`, plus
+   `…/Library/Caches/qemu/edk2-aarch64-code.fd`, all under
+   `~/Library/Containers/com.utmapp.UTM/Data`.
 3. Load the daemon. This also retires the UTM LaunchAgents from
    `vm-host-lifecycle.yml`, whose login agent would otherwise start the stale UTM
    VM next to this one:
@@ -922,7 +934,7 @@ Then the cutover, by hand, with the cluster quiet:
 stale and must not be started casually: it would share the MAC and IP with the
 runner's VM, and the runner refuses to start while any UTM VM is running.
 
-**Rolling back** (before the cluster has changed much): stop the daemon
+**Rolling back** (only worthwhile soon after the cutover, since the UTM disk does not follow the cluster): stop the daemon
 (`sudo launchctl kill TERM system/local.homelab.vm-runner`, wait for it to
 finish), then start the UTM VM, which still holds the pre-cutover disk.
 
