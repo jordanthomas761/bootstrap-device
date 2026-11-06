@@ -86,9 +86,10 @@
       loop_control:
         label: "{{ item.path }}"
 
+    # Generated as root and then handed over, not with become_user: Ansible cannot
+    # become an unprivileged user on macOS (it shares its temp files with a
+    # Linux-style ACL chmod that macOS rejects), so the task would fail.
     - name: Generate the runner's vm-ctl key (kept if it exists)
-      become: true
-      become_user: "{{ vm_runner_user }}"
       ansible.builtin.command:
         argv:
           - ssh-keygen
@@ -102,6 +103,16 @@
           - "{{ vm_runner_dir }}/.ssh/id_ed25519_vm_ctl"
       args:
         creates: "{{ vm_runner_dir }}/.ssh/id_ed25519_vm_ctl"
+
+    - name: Hand the key pair to the service user
+      ansible.builtin.file:
+        path: "{{ vm_runner_dir }}/.ssh/{{ item.name }}"
+        owner: "{{ vm_runner_user }}"
+        group: "{{ vm_runner_group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { name: id_ed25519_vm_ctl, mode: "0600" }
+        - { name: id_ed25519_vm_ctl.pub, mode: "0644" }
 
     # .ssh is private (0700), so playbooks/vm-ctl-access.yml reads the public half
     # from here instead.
