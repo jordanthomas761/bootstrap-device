@@ -1,6 +1,6 @@
 # Bootstrap Device
 
-An Ansible automation project for bootstrapping a small kubeadm Kubernetes cluster — one Ubuntu Server 24.04 control-plane VM and two Raspberry Pi 5 workers (Raspberry Pi OS, 64-bit) — plus general device provisioning (shell setup, remote desktop, ML tooling).
+An Ansible automation project for bootstrapping a small kubeadm Kubernetes cluster — one Ubuntu Server 26.04 control-plane VM and two Raspberry Pi 5 workers (Raspberry Pi OS, 64-bit) — plus general device provisioning (shell setup, remote desktop, ML tooling).
 
 ## Overview
 
@@ -18,7 +18,7 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 
 ## Prerequisites
 
-- One Ubuntu Server 24.04 control-plane VM and one or more Raspberry Pi 5 workers running Raspberry Pi OS (64-bit)
+- One Ubuntu Server 26.04 control-plane VM and one or more Raspberry Pi 5 workers running Raspberry Pi OS (64-bit)
 - Ansible installed on your control machine
 - SSH access to all devices
 - An inventory defining `control_plane` and `workers` groups (see `inventory/hosts.yml`)
@@ -53,7 +53,7 @@ This project bootstraps a kubeadm-based Kubernetes cluster across a control-plan
 
 ## Unattended VM Install (Control Plane)
 
-For a UTM/QEMU control-plane VM, `playbooks/build-autoinstall-iso.yml` generates an Ubuntu Server 24.04 `autoinstall` seed ISO so the OS installation requires no manual TUI steps:
+For a UTM/QEMU control-plane VM, `playbooks/build-autoinstall-iso.yml` generates an Ubuntu Server `autoinstall` seed ISO (written against the 24.04 installer) so the OS installation requires no manual TUI steps:
 
 ```bash
 ansible-playbook playbooks/build-autoinstall-iso.yml
@@ -331,9 +331,9 @@ What it does:
 ### Why the control plane holds no data
 
 `longhorn_storage_nodes` in `inventory/group_vars/all.yml` lists only the two
-Pis. The control plane has roughly 1 GB of available RAM and 19 GB of disk,
-against 400–860 GB of SSD on the Pis, so hosting replicas there would fill the
-disk and starve the API server. Longhorn's own components still run on it; only
+Pis. The control plane is a 7 GB VM on a 64 GB virtual disk, against
+400–860 GB of SSD on the Pis, so hosting replicas there would fill the disk
+that etcd and the API server depend on. Longhorn's own components still run on it; only
 the storage is kept off.
 
 The node labels drive Longhorn's `createDefaultDiskLabeledNodes` setting. Nodes
@@ -574,7 +574,7 @@ The nodes do not agree, and the role handles both:
 
 | Node | containerd | Registry stanza |
 |---|---|---|
-| control plane (Ubuntu 24.04) | 2.2.1 | `plugins.'io.containerd.cri.v1.images'.registry` |
+| control plane (Ubuntu 26.04) | 2.2.2 | `plugins.'io.containerd.cri.v1.images'.registry` |
 | `pi5-gpio`, `pi5-ml` (Debian trixie) | 1.7.24 | `plugins."io.containerd.grpc.v1.cri".registry` |
 
 The `hosts.toml` format is identical across both. What differs is more than

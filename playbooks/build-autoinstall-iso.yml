@@ -1,6 +1,7 @@
 ---
-# Builds a cloud-init NoCloud seed ISO so the Ubuntu Server 24.04 installer
-# runs unattended inside the UTM VM — no manual TUI steps. Run locally
+# Builds a cloud-init NoCloud seed ISO so the Ubuntu Server installer runs
+# unattended inside the UTM VM — no manual TUI steps. Written against the 24.04
+# installer; the control plane has since been release-upgraded to 26.04. Run locally
 # (this targets the Mac you're running Ansible from, not the VM):
 #
 #   ansible-playbook playbooks/build-autoinstall-iso.yml
