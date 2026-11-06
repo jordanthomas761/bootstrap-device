@@ -14,6 +14,14 @@
 #               Written to ~/.kube/claude-readonly.conf on the machine you run
 #               Ansible from.
 #
+# Each half also installs its wrapper in ~/.local/bin on that machine
+# (files/claude-ro/): `ssh-ro <cp-ro|gpio-ro|ml-ro> <cmd>` and
+# `kubectl-ro <args>`. Claude Code is meant to run only these, by full path,
+# with allow rules for them and ask rules for plain ssh/kubectl/ansible in
+# ~/.claude/settings.json. Those rules are per-user and not managed here:
+#   allow: Bash(~/.local/bin/ssh-ro *), Bash(~/.local/bin/kubectl-ro *)
+#   ask:   Bash(ssh *), Bash(kubectl *), Bash(ansible *), Bash(ansible-playbook *)
+#
 # What stays unreadable, on purpose, because reading any of it IS control of
 # the cluster: admin.conf / super-admin.conf, kubelet.conf, /etc/kubernetes/pki,
 # the etcd encryption key, the contents of the etcd snapshots (every Secret),
@@ -114,6 +122,25 @@
             IdentityFile {{ claude_ro_key }}
             IdentitiesOnly yes
           {% endfor %}
+
+    # The wrapper Claude Code is allowed to run (by an allow rule in
+    # ~/.claude/settings.json) instead of plain ssh: only the -ro aliases,
+    # and nothing after the host can become an ssh option.
+    - name: Install the ssh-ro wrapper locally
+      delegate_to: localhost
+      when: inventory_hostname == ansible_play_hosts[0]
+      block:
+        - name: Ensure ~/.local/bin exists locally
+          ansible.builtin.file:
+            path: "{{ lookup('env', 'HOME') }}/.local/bin"
+            state: directory
+            mode: "0755"
+
+        - name: Install ~/.local/bin/ssh-ro
+          ansible.builtin.copy:
+            src: files/claude-ro/ssh-ro
+            dest: "{{ lookup('env', 'HOME') }}/.local/bin/ssh-ro"
+            mode: "0755"
 
     - name: Create claude-ro with a locked password
       become: true
@@ -437,6 +464,23 @@
       retries: 10
       delay: 3
       no_log: true
+
+    # The wrapper Claude Code is allowed to run instead of plain kubectl: it
+    # always uses the read-only kubeconfig and refuses flags that would swap
+    # in other credentials.
+    - name: Ensure ~/.local/bin exists locally
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/.local/bin"
+        state: directory
+        mode: "0755"
+
+    - name: Install ~/.local/bin/kubectl-ro
+      delegate_to: localhost
+      ansible.builtin.copy:
+        src: files/claude-ro/kubectl-ro
+        dest: "{{ lookup('env', 'HOME') }}/.local/bin/kubectl-ro"
+        mode: "0755"
 
     - name: Ensure ~/.kube exists locally
       delegate_to: localhost

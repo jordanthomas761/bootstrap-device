@@ -1,0 +1,16 @@
+#!/bin/bash
+# Read-only kubectl for Claude Code: always the claude-readonly ServiceAccount
+# kubeconfig, never ~/.kube/config. The token itself can only get/list/watch;
+# this wrapper just makes sure the admin credentials can't be swapped in.
+#   kubectl-ro <kubectl args...>
+set -euo pipefail
+conf="$HOME/.kube/claude-readonly.conf"
+[ -r "$conf" ] || { echo "kubectl-ro: $conf missing; run playbooks/claude-readonly-access.yml" >&2; exit 2; }
+for a in "$@"; do
+  case "$a" in
+    --kubeconfig*|--context*|--cluster*|--user*|--token*|--as*|--server*|-s|-s=*|\
+    --client-certificate*|--client-key*|--username*|--password*|--certificate-authority*|--insecure-skip-tls-verify*)
+      echo "kubectl-ro: '$a' is not allowed; credentials are fixed" >&2; exit 2 ;;
+  esac
+done
+exec env -u KUBECONFIG kubectl --kubeconfig "$conf" "$@"
