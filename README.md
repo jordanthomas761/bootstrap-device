@@ -813,6 +813,7 @@ tracked in the issue:
 │   └── 45-allow-colord.pkla     # Polkit policy for Colord
 └── playbooks/
     ├── passwordless-sudo.yml      # One-time: grants NOPASSWD sudo so -K isn't needed on later runs
+    ├── claude-readonly-access.yml # Read-only SSH user + view-only kubeconfig for Claude Code
     ├── raspberry-pi-motd.yml     # Worker MOTD
     ├── control-plane-motd.yml    # Control-plane MOTD
     ├── oh-my-zsh.yml            # ZSH shell setup
