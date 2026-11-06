@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by playbooks/vm-host-lifecycle.yml — do not edit by hand. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{ vm_lifecycle_label_prefix }}.shutdown-run</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ vm_lifecycle_bin_dir }}/cluster-shutdown</string>
+        <string>--from-agent</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- No RunAtLoad and no KeepAlive: this only ever runs when
+         cluster-shutdown, started over SSH, kickstarts it. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>StandardOutPath</key>
+    <string>{{ vm_lifecycle_log_dir }}/shutdown-run.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{ vm_lifecycle_log_dir }}/shutdown-run.log</string>
+</dict>
+</plist>

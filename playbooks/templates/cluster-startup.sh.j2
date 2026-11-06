@@ -33,12 +33,24 @@ wait_for() {
   log "$what: ready"
 }
 
-# utmctl drives the UTM app, which has to be running in this login session.
+# utmctl drives the UTM app through Apple Events, so it only works inside the
+# logged-in GUI session and crashes over SSH. Outside it, hand the work to the
+# launchd agent that lives inside it and relay the result.
+if [ "$(launchctl managername 2>/dev/null)" != "Aqua" ]; then
+  exec "{{ vm_lifecycle_bin_dir }}/cluster-vm-gui-run" \
+    "{{ vm_lifecycle_label_prefix }}.startup" "{{ vm_lifecycle_log_dir }}/startup.log"
+fi
+
+# UTM has to be running in this login session.
 if ! pgrep -x UTM >/dev/null 2>&1; then
   log "launching UTM"
   open -g -a "$UTM_APP" || die "could not open $UTM_APP"
   sleep 5
 fi
+
+# At login UTM can be up before it lists its VMs ("Virtual machine not found",
+# utmapp/UTM#6346), so retry rather than fail on the first look.
+wait_for "UTM listing '$VM'" "$UTMCTL" status "$VM"
 
 case "$(vm_state)" in
   *started*|*starting*)

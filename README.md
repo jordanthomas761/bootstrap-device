@@ -798,6 +798,12 @@ passwordless sudo (`playbooks/passwordless-sudo.yml`). Logs are in
   logged-in session, so these are LaunchAgents. A Mac that reboots to the login
   window starts nothing until someone logs in. Enable automatic login for an
   unattended start.
+- **`utmctl` crashes over SSH.** It drives UTM through Apple Events, so it only
+  works inside the logged-in GUI session. `cluster-shutdown` and
+  `cluster-startup` detect a non-GUI shell and hand the work to a launchd agent
+  inside the GUI session (`cluster-vm-gui-run`), then print its log, so both work
+  from SSH while someone is logged in at the Mac. With nobody logged in they
+  stop and say so.
 - **The shutdown hook is best effort.** launchd honours `ExitTimeOut` (raised
   from its 20s default), but macOS can cut a real system shutdown shorter. When
   it does, the 6-hourly etcd snapshot timer is the backstop: the worst case is a

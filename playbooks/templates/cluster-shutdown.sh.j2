@@ -22,6 +22,21 @@ KUBECONFIG_PATH="{{ cluster_cp_kubeconfig }}"
 ANNOTATION="{{ cluster_cordon_annotation }}"
 TIMEOUT={{ vm_shutdown_timeout }}
 
+ARGS_FILE="{{ vm_lifecycle_log_dir }}/.shutdown-args"
+
+# utmctl only works inside the logged-in GUI session (it drives UTM through
+# Apple Events), so over SSH it crashes. Outside that session, hand the work to
+# the on-demand launchd agent that lives inside it and relay the result.
+if [ "${1:-}" = "--from-agent" ]; then
+  # shellcheck disable=SC2046
+  set -- $(cat "$ARGS_FILE" 2>/dev/null || true)
+  rm -f "$ARGS_FILE"
+elif [ "$(launchctl managername 2>/dev/null)" != "Aqua" ]; then
+  echo "$*" > "$ARGS_FILE"
+  exec "{{ vm_lifecycle_bin_dir }}/cluster-vm-gui-run" \
+    "{{ vm_lifecycle_label_prefix }}.shutdown-run" "{{ vm_lifecycle_log_dir }}/shutdown-run.log"
+fi
+
 CORDON=0
 PROCEED=0
 for arg in "$@"; do

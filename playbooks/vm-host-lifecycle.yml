@@ -16,6 +16,12 @@
 #   cluster-shutdown       the same shutdown, runnable by hand before a
 #                          planned restart.
 #
+# utmctl drives UTM through Apple Events, so it only works inside the logged-in
+# GUI session and crashes over SSH. cluster-shutdown and cluster-startup
+# therefore detect a non-GUI shell and hand the work to a launchd agent inside
+# the GUI session (cluster-vm-gui-run), then relay its log, so both work from an
+# SSH session as long as someone is logged in at the Mac.
+#
 # REQUIRED INVENTORY
 #
 #   - the Mac under the vm_host group in inventory/hosts.yml
@@ -79,6 +85,7 @@
         - { src: cluster-shutdown.sh.j2, dest: cluster-shutdown }
         - { src: cluster-startup.sh.j2, dest: cluster-startup }
         - { src: cluster-shutdown-hook.sh.j2, dest: cluster-shutdown-hook }
+        - { src: cluster-vm-gui-run.sh.j2, dest: cluster-vm-gui-run }
 
     - name: Install the launchd agents
       ansible.builtin.template:
@@ -88,6 +95,7 @@
       loop:
         - { src: cluster-vm-shutdown-hook.plist.j2, name: shutdown-hook }
         - { src: cluster-vm-startup.plist.j2, name: startup }
+        - { src: cluster-vm-shutdown-run.plist.j2, name: shutdown-run }
       notify: Reload the lifecycle agents
 
     - name: Smoke-test that the VM is visible to utmctl
@@ -108,7 +116,7 @@
     # run; bootstrap is the step that has to succeed.
     - name: Reload the lifecycle agents
       ansible.builtin.shell: |
-        for name in shutdown-hook startup; do
+        for name in shutdown-hook startup shutdown-run; do
           label="{{ vm_lifecycle_label_prefix }}.$name"
           launchctl bootout "gui/{{ ansible_facts.user_uid }}/$label" 2>/dev/null || true
           launchctl bootstrap "gui/{{ ansible_facts.user_uid }}" \
