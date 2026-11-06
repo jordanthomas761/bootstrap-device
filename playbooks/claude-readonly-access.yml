@@ -478,8 +478,15 @@
         k=(kubectl --kubeconfig {{ claude_ro_kubeconfig | quote }})
         fail=0
         "${k[@]}" get nodes >/dev/null || { echo "cannot list nodes"; fail=1; }
-        for check in "get secrets -A" "delete pods -A" "create pods/exec -A" \
-                     "patch nodes" "create deployments -A" "get nodes/proxy"; do
+        # Subresources go in --subresource: `can-i get nodes/proxy` asks about
+        # a node NAMED "proxy", which plain get-nodes allows, and so reports a
+        # false "yes" (and `create pods/exec` a meaningless "no").
+        for check in "get secrets -A" "delete pods -A" "patch nodes" \
+                     "create deployments -A" \
+                     "create pods --subresource=exec -A" \
+                     "create pods --subresource=attach -A" \
+                     "create pods --subresource=portforward -A" \
+                     "get nodes --subresource=proxy"; do
           # $check is split on purpose: each one is a verb, resource and flags.
           # shellcheck disable=SC2086
           [ "$("${k[@]}" auth can-i $check 2>/dev/null)" = "no" ] || { echo "allowed: $check"; fail=1; }
