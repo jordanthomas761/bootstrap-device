@@ -83,10 +83,12 @@
     # The key and aliases live on the machine running Ansible. They are done
     # here, delegated and once, rather than in a localhost play, so that a run
     # with --limit <node> (which would skip a localhost play) still creates the
-    # key before the public half is read below.
+    # key before the public half is read below. "Once" is the first host in
+    # the play rather than run_once, which ansible-lint's production profile
+    # rejects (run-once[task]) and which the free strategy would not honour.
     - name: Generate the read-only SSH key (no passphrase, used unattended)
       delegate_to: localhost
-      run_once: true
+      when: inventory_hostname == ansible_play_hosts[0]
       ansible.builtin.command:
         argv: [ssh-keygen, -t, ed25519, -N, "", -C, claude-ro, -f, "{{ claude_ro_key }}"]
         creates: "{{ claude_ro_key }}"
@@ -97,7 +99,7 @@
     # inventory host.
     - name: Add the read-only aliases to ~/.ssh/config
       delegate_to: localhost
-      run_once: true
+      when: inventory_hostname == ansible_play_hosts[0]
       ansible.builtin.blockinfile:
         path: "{{ lookup('env', 'HOME') }}/.ssh/config"
         create: true
