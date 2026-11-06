@@ -1,0 +1,39 @@
+---
+# The Mac that runs the UTM control-plane VM. Consumed by
+# playbooks/vm-host-lifecycle.yml -- nothing in main.yml touches it.
+
+# The login user the agents run as. UTM is a GUI app: utmctl only works inside
+# that user's logged-in session, so these are per-user LaunchAgents, not
+# system LaunchDaemons.
+vm_host_user: "{{ ansible_user | default(ansible_user_id) }}"
+vm_host_home: "/Users/{{ vm_host_user }}"
+
+# REQUIRED. The VM's name (or UUID) exactly as `utmctl list` prints it.
+# Deliberately unset: acting on the wrong VM is worse than failing the
+# preflight assertion in the playbook.
+# utm_vm_name: ""
+
+utm_app: /Applications/UTM.app
+utmctl_bin: "{{ utm_app }}/Contents/MacOS/utmctl"
+
+# How the scripts reach the control plane: as the restricted vm-ctl user with a
+# dedicated key generated on this Mac by playbooks/vm-ctl-access.yml. The verbs it
+# may run, and why it is not the admin login, are in inventory/group_vars/all.yml.
+cluster_cp_host: "{{ hostvars['k8s-cp'].ansible_host }}"
+vm_ctl_key: "{{ vm_host_home }}/.ssh/id_ed25519_vm_ctl"
+
+# Where the scripts, plists and logs go. All under the login user's home, so
+# nothing here needs root.
+vm_lifecycle_bin_dir: "{{ vm_host_home }}/.local/bin"
+vm_lifecycle_log_dir: "{{ vm_host_home }}/Library/Logs/cluster-vm"
+vm_lifecycle_agents_dir: "{{ vm_host_home }}/Library/LaunchAgents"
+vm_lifecycle_label_prefix: local.homelab.cluster-vm
+
+# Seconds. Shutdown: the snapshot (~10s) plus the guest powering off. Startup:
+# VM boot plus kubeadm's static pods coming back, which is slow on a small VM.
+vm_shutdown_timeout: 180
+vm_startup_timeout: 600
+
+# How long launchd lets the shutdown hook run after SIGTERM before SIGKILL.
+# macOS may still cut a real system shutdown shorter than this; see the README.
+vm_hook_exit_timeout: 240

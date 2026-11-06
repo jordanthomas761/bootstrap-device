@@ -1,0 +1,4 @@
+# Managed by playbooks/vm-ctl-access.yml — do not hand-edit.
+# Each verb is listed exactly, so sudo matches the command AND its argument.
+{{ vm_ctl_user }} ALL=(root) NOPASSWD: {% for verb in vm_ctl_verbs %}{{ vm_ctl_root_bin }} {{ verb }}{% if not loop.last %}, {% endif %}{% endfor %}
+

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by playbooks/vm-host-lifecycle.yml — do not edit by hand. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{ vm_lifecycle_label_prefix }}.shutdown-hook</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ vm_lifecycle_bin_dir }}/cluster-shutdown-hook</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Idle at login, doing nothing, so there is a process to signal later. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only if it crashes. A clean exit after handling SIGTERM must
+         not respawn it in the middle of a shutdown. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- How long launchd waits after SIGTERM before SIGKILL. The default of
+         20s is far too short for a snapshot plus a guest poweroff. -->
+    <key>ExitTimeOut</key>
+    <integer>{{ vm_hook_exit_timeout }}</integer>
+
+    <key>StandardOutPath</key>
+    <string>{{ vm_lifecycle_log_dir }}/shutdown-hook.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{ vm_lifecycle_log_dir }}/shutdown-hook.err.log</string>
+</dict>
+</plist>

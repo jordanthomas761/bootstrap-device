@@ -1,0 +1,17 @@
+#!/bin/bash
+# Managed by playbooks/vm-ctl-access.yml — do not hand-edit.
+#
+# sshd forced command for the vm-ctl user's key (authorized_keys `command=`).
+# The client's requested command arrives in SSH_ORIGINAL_COMMAND and is compared
+# against a fixed list as a whole string, never interpreted by a shell, so
+# "snapshot; id" matches nothing and is refused.
+set -eu
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+{% for verb in vm_ctl_verbs %}
+  {{ verb }}) exec sudo -n {{ vm_ctl_root_bin }} {{ verb }} ;;
+{% endfor %}
+  *)
+    echo "vm-ctl: allowed commands: {{ vm_ctl_verbs | join(' ') }}" >&2
+    exit 2 ;;
+esac

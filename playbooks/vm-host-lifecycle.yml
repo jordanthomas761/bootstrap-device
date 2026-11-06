@@ -1,0 +1,127 @@
+# Automates the control-plane VM's lifecycle on the Mac that runs it in UTM, so
+# macOS updates and restarts need no manual steps.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/vm-host-lifecycle.yml
+#
+# WHAT IT INSTALLS (all per-user, no root)
+#
+#   cluster-startup        at login: open UTM, start the VM, wait for SSH and the
+#                          API server, uncordon the nodes cluster-shutdown
+#                          cordoned.
+#   cluster-shutdown-hook  idles from login; on SIGTERM (logout, restart,
+#                          shutdown, a macOS update's reboot) runs
+#                          cluster-shutdown --cordon: verified etcd snapshot
+#                          shipped off-host, guest poweroff, wait for UTM to
+#                          report the VM stopped.
+#   cluster-shutdown       the same shutdown, runnable by hand before a
+#                          planned restart.
+#
+# utmctl drives UTM through Apple Events, so it only works inside the logged-in
+# GUI session and crashes over SSH. cluster-shutdown and cluster-startup
+# therefore detect a non-GUI shell and hand the work to a launchd agent inside
+# the GUI session (cluster-vm-gui-run), then relay its log, so both work from an
+# SSH session as long as someone is logged in at the Mac.
+#
+# REQUIRED INVENTORY
+#
+#   - the Mac under the vm_host group in inventory/hosts.yml
+#   - utm_vm_name in inventory/group_vars/vm_host.yml (see `utmctl list`)
+#   - playbooks/vm-ctl-access.yml run first: it makes the Mac's key and a
+#     restricted vm-ctl user on the control plane that can run only a fixed set
+#     of verbs (no admin login or sudo involved)
+#
+# LIMITS, SO THEY ARE NOT A SURPRISE
+#
+#   - These are LaunchAgents, because utmctl drives the UTM GUI app and needs a
+#     logged-in session. A Mac that reboots to the login window starts nothing
+#     until someone logs in. Automatic login is not available with FileVault
+#     on, which also stops the Mac at its pre-boot unlock screen after a restart.
+#   - The shutdown hook is best effort. launchd honours ExitTimeOut, but macOS
+#     can cut a system shutdown short. The 6-hourly etcd snapshot timer is the
+#     backstop, and cluster-shutdown by hand is the guaranteed path.
+#   - utmctl's stop flags and status strings are not fully documented, so the
+#     scripts match "stopped"/"started" loosely and only use `stop --request`
+#     after confirming this utmctl lists it.
+- name: Install control-plane VM lifecycle automation on the UTM host
+  hosts: vm_host
+
+  tasks:
+    - name: Assert this is macOS and the VM name is set
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system == "Darwin"
+          - utm_vm_name is defined
+          - (utm_vm_name | default('') | trim) | length > 0
+        fail_msg: >-
+          playbooks/vm-host-lifecycle.yml targets the macOS host running the
+          UTM VM. Put it in the vm_host group and set utm_vm_name in
+          inventory/group_vars/vm_host.yml (the name `utmctl list` prints).
+          There is deliberately no default.
+
+    - name: Check that utmctl exists
+      ansible.builtin.stat:
+        path: "{{ utmctl_bin }}"
+      register: vm_host_utmctl
+
+    - name: Require UTM to be installed
+      ansible.builtin.assert:
+        that: vm_host_utmctl.stat.exists
+        fail_msg: "{{ utmctl_bin }} not found; install UTM or set utm_app."
+
+    - name: Create the script, agent and log directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ vm_lifecycle_bin_dir }}"
+        - "{{ vm_lifecycle_agents_dir }}"
+        - "{{ vm_lifecycle_log_dir }}"
+
+    - name: Install the lifecycle scripts
+      ansible.builtin.template:
+        src: "templates/{{ item.src }}"
+        dest: "{{ vm_lifecycle_bin_dir }}/{{ item.dest }}"
+        mode: "0755"
+      loop:
+        - { src: cluster-shutdown.sh.j2, dest: cluster-shutdown }
+        - { src: cluster-startup.sh.j2, dest: cluster-startup }
+        - { src: cluster-shutdown-hook.sh.j2, dest: cluster-shutdown-hook }
+        - { src: cluster-vm-gui-run.sh.j2, dest: cluster-vm-gui-run }
+
+    - name: Install the launchd agents
+      ansible.builtin.template:
+        src: "templates/{{ item.src }}"
+        dest: "{{ vm_lifecycle_agents_dir }}/{{ vm_lifecycle_label_prefix }}.{{ item.name }}.plist"
+        mode: "0644"
+      loop:
+        - { src: cluster-vm-shutdown-hook.plist.j2, name: shutdown-hook }
+        - { src: cluster-vm-startup.plist.j2, name: startup }
+        - { src: cluster-vm-shutdown-run.plist.j2, name: shutdown-run }
+      notify: Reload the lifecycle agents
+
+    - name: Smoke-test that the VM is visible to utmctl
+      ansible.builtin.command: "{{ utmctl_bin }} status {{ utm_vm_name | quote }}"
+      register: vm_host_vm_status
+      changed_when: false
+      failed_when: false
+
+    - name: Report the VM status (a failure here means a wrong name or UTM not running)
+      ansible.builtin.debug:
+        msg: >-
+          utmctl status {{ utm_vm_name }}: rc={{ vm_host_vm_status.rc }}
+          {{ (vm_host_vm_status.stdout | default('')) | trim }}
+          {{ (vm_host_vm_status.stderr | default('')) | trim }}
+
+  handlers:
+    # bootout fails when the agent is not loaded yet, which is normal on a first
+    # run; bootstrap is the step that has to succeed.
+    - name: Reload the lifecycle agents
+      ansible.builtin.shell: |
+        for name in shutdown-hook startup shutdown-run; do
+          label="{{ vm_lifecycle_label_prefix }}.$name"
+          launchctl bootout "gui/{{ ansible_facts.user_uid }}/$label" 2>/dev/null || true
+          launchctl bootstrap "gui/{{ ansible_facts.user_uid }}" \
+            "{{ vm_lifecycle_agents_dir }}/$label.plist"
+        done
+      changed_when: true
