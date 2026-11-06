@@ -161,16 +161,31 @@
     # runner starts: their login agent would start the now-stale UTM VM, with the
     # same MAC and IP, next to the runner's. bootout from root works on a user's
     # gui domain; the plists are removed so they do not return at next login.
-    - name: Look up the login user's uid (for the agents being retired)
+    # This play runs under sudo, so ansible_user_id (and therefore vm_host_home)
+    # is root. The agents belong to the person who ran ansible: SUDO_USER.
+    - name: Work out whose LaunchAgents are being retired
+      ansible.builtin.set_fact:
+        vm_runner_login_user: "{{ ansible_facts.env.SUDO_USER | default(vm_host_user) }}"
+      when: vm_runner_load | bool
+
+    - name: Look up the login user's home (for the agents being retired)
       ansible.builtin.stat:
-        path: "{{ vm_host_home }}"
+        path: "/Users/{{ vm_runner_login_user }}"
       register: vm_runner_login_home
+      when: vm_runner_load | bool
+
+    - name: Require that home
+      ansible.builtin.assert:
+        that: vm_runner_login_home.stat.exists
+        fail_msg: >-
+          /Users/{{ vm_runner_login_user }} does not exist, so the UTM agents
+          cannot be found. Set vm_host_user for this host.
       when: vm_runner_load | bool
 
     - name: Retire the UTM-based LaunchAgents (cutover only)
       ansible.builtin.shell: |
         launchctl bootout gui/{{ vm_runner_login_home.stat.uid }}/{{ vm_lifecycle_label_prefix }}.{{ item }} 2>/dev/null || true
-        rm -f "{{ vm_lifecycle_agents_dir }}/{{ vm_lifecycle_label_prefix }}.{{ item }}.plist"
+        rm -f "/Users/{{ vm_runner_login_user }}/Library/LaunchAgents/{{ vm_lifecycle_label_prefix }}.{{ item }}.plist"
       loop:
         - shutdown-hook
         - startup
