@@ -1,0 +1,43 @@
+#!/bin/bash
+# {{ ansible_managed }}
+#
+# Grants (or with --remove, withdraws) claude-ro's read ACLs on the paths in
+# claude_ro_read_paths. Run by claude-ro-acl.timer and after every etcd
+# snapshot, because the grants do not stick on their own:
+#   - a file that is replaced rather than edited (kubeadm upgrade rewriting
+#     the manifests and config.yaml, a templated config, a new upgrade log)
+#     comes back without the entry;
+#   - chmod on a path that has an ACL rewrites the ACL mask from its group
+#     bits, so etcd-snapshot.sh's `chmod 0700` on the backup directory masks
+#     the entry to nothing.
+# setfacl -m recomputes the mask, so re-running repairs both.
+#
+# Prints "changed: <path>" for each path whose ACLs it actually changed.
+set -euo pipefail
+
+mode=grant
+if [ "${1:-}" = "--remove" ]; then
+  mode=remove
+fi
+
+apply() {
+  local perms=$1 recursive=$2 path=$3
+  local r=() before after
+  [ -e "$path" ] || return 0
+  [ "$recursive" = yes ] && r=(-R)
+  before=$(getfacl -p "${r[@]}" "$path" 2>/dev/null)
+  if [ "$mode" = remove ]; then
+    # Errors only when there is no entry to remove.
+    setfacl "${r[@]}" -x u:claude-ro "$path" 2>/dev/null || true
+  else
+    setfacl "${r[@]}" -m "u:claude-ro:${perms}" "$path"
+  fi
+  after=$(getfacl -p "${r[@]}" "$path" 2>/dev/null)
+  if [ "$before" != "$after" ]; then
+    echo "changed: $path"
+  fi
+}
+
+{% for p in claude_ro_read_paths %}
+apply {{ p.perms }} {{ 'yes' if p.recursive | default(false) else 'no' }} {{ p.path }}
+{% endfor %}

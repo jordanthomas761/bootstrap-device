@@ -28,62 +28,40 @@
 #   ansible-playbook -i inventory/hosts.yml playbooks/claude-readonly-access.yml
 #
 # The kubeconfig half needs a working API server; run `--tags ssh` alone while
-# the cluster is down. Safe to re-run.
+# the cluster is down. Safe to re-run, and safe with --limit.
 #
-# Revoke:
-#   ssh       sudo userdel -r claude-ro            (each node; the ACL entries
-#                                                   go inert with the user)
-#   kube API  kubectl -n kube-system delete secret claude-readonly-token
-#             (invalidates the token at once), then delete the
-#             ServiceAccount, ClusterRoleBinding and ClusterRole of that name.
-
-- name: Prepare the local read-only SSH key and aliases
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  tags:
-    - ssh
-  vars:
-    claude_ro_key: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519_claude_ro"
-    # Inventory hostname -> the ssh alias Claude Code is allowed to use.
-    claude_ro_aliases:
-      k8s-cp: cp-ro
-      pi5-gpio: gpio-ro
-      pi5-ml: ml-ro
-
-  tasks:
-    - name: Generate the read-only SSH key (no passphrase, used unattended)
-      ansible.builtin.command:
-        cmd: >-
-          ssh-keygen -t ed25519 -N '' -C claude-ro
-          -f {{ claude_ro_key }}
-        creates: "{{ claude_ro_key }}"
-
-    # At the top of the file: ssh takes the first value it finds per option,
-    # so a later `Host *` block cannot override User or IdentityFile here.
-    - name: Add the read-only aliases to ~/.ssh/config
-      ansible.builtin.blockinfile:
-        path: "{{ lookup('env', 'HOME') }}/.ssh/config"
-        create: true
-        mode: "0600"
-        insertbefore: BOF
-        marker: "# {mark} ANSIBLE MANAGED - claude read-only access"
-        block: |
-          {% for host, alias in claude_ro_aliases.items() %}
-          Host {{ alias }}
-            HostName {{ hostvars[host].ansible_host }}
-            User claude-ro
-            IdentityFile {{ claude_ro_key }}
-            IdentitiesOnly yes
-          {% endfor %}
+# The read ACLs do not survive files being replaced or chmod'ed (see
+# templates/claude-ro-acl.sh.j2), so each node gets a claude-ro-acl.timer that
+# re-applies them every 10 minutes, and the control plane re-applies them
+# right after each etcd snapshot.
+#
+# Revoke, on each node, in this order. ACLs store the numeric UID, so the
+# entries must go before the user does; left behind, they would hand the same
+# read access to whichever account is next created with that UID:
+#   sudo systemctl disable --now claude-ro-acl.timer
+#   sudo /usr/local/sbin/claude-ro-acl --remove
+#   sudo rm -f /usr/local/sbin/claude-ro-acl \
+#     /etc/systemd/system/claude-ro-acl.{service,timer} \
+#     /etc/systemd/system/etcd-snapshot.service.d/claude-ro-acl.conf
+#   sudo systemctl daemon-reload
+#   sudo userdel -r claude-ro
+# Then on the API:
+#   kubectl -n kube-system delete secret claude-readonly-token
+#   (invalidates the token at once), then delete the ServiceAccount,
+#   ClusterRoleBinding and ClusterRole named claude-readonly.
 
 - name: Create the read-only claude-ro user on every node
   hosts: control_plane:workers
   tags:
     - ssh
   vars:
-    claude_ro_pubkey: >-
-      {{ lookup('file', lookup('env', 'HOME') ~ '/.ssh/id_ed25519_claude_ro.pub') }}
+    claude_ro_key: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519_claude_ro"
+    claude_ro_pubkey: "{{ lookup('file', claude_ro_key ~ '.pub') }}"
+    # Inventory hostname -> the ssh alias Claude Code is allowed to use.
+    claude_ro_aliases:
+      k8s-cp: cp-ro
+      pi5-gpio: gpio-ro
+      pi5-ml: ml-ro
     # Root-only paths claude-ro may read. Each one is checked for credentials
     # before it goes here. `X` grants traverse/list on directories and read on
     # files; `x` is traverse only (reach a known path, list nothing).
@@ -102,6 +80,39 @@
       - {path: /var/log/apt, perms: rX, recursive: true}
 
   tasks:
+    # The key and aliases live on the machine running Ansible. They are done
+    # here, delegated and once, rather than in a localhost play, so that a run
+    # with --limit <node> (which would skip a localhost play) still creates the
+    # key before the public half is read below.
+    - name: Generate the read-only SSH key (no passphrase, used unattended)
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.command:
+        argv: [ssh-keygen, -t, ed25519, -N, "", -C, claude-ro, -f, "{{ claude_ro_key }}"]
+        creates: "{{ claude_ro_key }}"
+
+    # At the top of the file: ssh takes the first value it finds per option,
+    # so a later `Host *` block cannot override User or IdentityFile here.
+    # All aliases are written whatever --limit says; hostvars covers every
+    # inventory host.
+    - name: Add the read-only aliases to ~/.ssh/config
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.blockinfile:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/config"
+        create: true
+        mode: "0600"
+        insertbefore: BOF
+        marker: "# {mark} ANSIBLE MANAGED - claude read-only access"
+        block: |
+          {% for host, alias in claude_ro_aliases.items() %}
+          Host {{ alias }}
+            HostName {{ hostvars[host].ansible_host }}
+            User claude-ro
+            IdentityFile {{ claude_ro_key }}
+            IdentitiesOnly yes
+          {% endfor %}
+
     - name: Create claude-ro with a locked password
       become: true
       become_method: ansible.builtin.sudo
@@ -146,39 +157,104 @@
         name: acl
         state: present
 
-    # As root: /var/lib/kubelet is not traversable by the connecting user, so
-    # an unprivileged stat would report the kubelet config as missing.
-    - name: Check which read paths exist on this host
+    # A plain ACL entry, not a group or mode change: the files keep their
+    # owner and mode, and nothing else gains access.
+    - name: Install the ACL grant script
       become: true
       become_method: ansible.builtin.sudo
-      ansible.builtin.stat:
-        path: "{{ item.path }}"
-      loop: "{{ claude_ro_read_paths }}"
-      loop_control:
-        label: "{{ item.path }}"
-      register: claude_ro_read_path_stat
+      ansible.builtin.template:
+        src: templates/claude-ro-acl.sh.j2
+        dest: /usr/local/sbin/claude-ro-acl
+        owner: root
+        group: root
+        mode: "0755"
 
-    # A plain ACL entry, not a group or mode change: the files keep their
-    # owner and mode, and nothing else gains access. Re-applied on each run,
-    # so files that appear later in a recursive path (new logs) are covered
-    # the next time this runs.
+    - name: Install the ACL re-apply service and timer
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - name: claude-ro-acl.service
+          content: |
+            # {{ ansible_managed }}
+            [Unit]
+            Description=Re-apply claude-ro read ACLs
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/claude-ro-acl
+        - name: claude-ro-acl.timer
+          content: |
+            # {{ ansible_managed }}
+            [Unit]
+            Description=Re-apply claude-ro read ACLs every 10 minutes
+
+            [Timer]
+            OnBootSec=2min
+            OnUnitActiveSec=10min
+
+            [Install]
+            WantedBy=timers.target
+      loop_control:
+        label: "{{ item.name }}"
+
+    # The snapshot script chmods the backup directory on every run, which
+    # masks claude-ro's entry; repair it straight away instead of up to ten
+    # minutes later. `-` so a failure here never fails the backup itself.
+    - name: Re-apply the ACLs after each etcd snapshot
+      when: inventory_hostname in groups['control_plane']
+      block:
+        - name: Create the etcd-snapshot.service drop-in directory
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.file:
+            path: /etc/systemd/system/etcd-snapshot.service.d
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Add the ACL re-apply drop-in
+          become: true
+          become_method: ansible.builtin.sudo
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/etcd-snapshot.service.d/claude-ro-acl.conf
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # {{ ansible_managed }}
+              [Service]
+              ExecStartPost=-/usr/local/sbin/claude-ro-acl
+
+    - name: Enable the ACL re-apply timer
+      become: true
+      become_method: ansible.builtin.sudo
+      ansible.builtin.systemd_service:
+        name: claude-ro-acl.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
     - name: Grant claude-ro read ACLs on the listed paths
       become: true
       become_method: ansible.builtin.sudo
-      ansible.builtin.command:
-        argv: >-
-          {{ ['setfacl'] + (['-R'] if item.item.recursive | default(false) else [])
-             + ['-m', 'u:claude-ro:' ~ item.item.perms, item.item.path] }}
-      loop: "{{ claude_ro_read_path_stat.results }}"
-      loop_control:
-        label: "{{ item.item.path }}"
-      when: item.stat.exists
-      changed_when: false
+      ansible.builtin.command: /usr/local/sbin/claude-ro-acl
+      register: claude_ro_acl_run
+      changed_when: "'changed:' in claude_ro_acl_run.stdout"
 
-    # Checked, not assumed: a sudoers rule for a group claude-ro is in, a
-    # stray drop-in naming it, or an ACL that reached too far would quietly
-    # turn this user into an admin.
-    - name: Verify claude-ro has no sudo and cannot read cluster credentials
+    # Checked, not assumed. sudo itself is asked what claude-ro may run, so a
+    # sudoers rule for any group it is in (adm, systemd-journal) is caught,
+    # not just rules naming it. Any answer other than "not allowed" fails,
+    # including an unexpected message from sudo-rs, which is the safe way to
+    # be wrong. Credential checks cover every private key, not a sample, and
+    # the readable paths are checked too so a lost grant shows up here.
+    - name: Verify claude-ro has no sudo, cannot read credentials, and can read its paths
       become: true
       become_method: ansible.builtin.sudo
       ansible.builtin.shell: |
@@ -188,17 +264,31 @@
           id -nG claude-ro | tr ' ' '\n' | grep -qx "$g" && { echo "in group $g"; fail=1; }
         done
         grep -rqs claude-ro /etc/sudoers /etc/sudoers.d && { echo "named in sudoers"; fail=1; }
+        sudo_out=$(sudo -n -l -U claude-ro 2>&1 || true)
+        printf '%s\n' "$sudo_out" | grep -qi 'not allowed' \
+          || { echo "sudo -l -U claude-ro did not report 'not allowed': $sudo_out"; fail=1; }
+        cannot_read() {
+          if runuser -u claude-ro -- test -r "$1"; then
+            echo "can read $1"; fail=1
+          fi
+        }
         for f in /etc/kubernetes/admin.conf /etc/kubernetes/super-admin.conf \
-                 /etc/kubernetes/kubelet.conf /etc/kubernetes/pki/ca.key \
-                 /etc/kubernetes/enc/key1.b64 /var/lib/kubelet/pki \
+                 /etc/kubernetes/kubelet.conf /etc/kubernetes/scheduler.conf \
+                 /etc/kubernetes/controller-manager.conf \
                  /run/containerd/containerd.sock; do
-          [ -e "$f" ] || continue
-          runuser -u claude-ro -- test -r "$f" && { echo "can read $f"; fail=1; }
+          [ -e "$f" ] && cannot_read "$f"
         done
-        for f in /var/backups/etcd/*; do
-          [ -f "$f" ] || continue
-          runuser -u claude-ro -- test -r "$f" && { echo "can read $f"; fail=1; }
-        done
+        while IFS= read -r -d '' f; do
+          cannot_read "$f"
+        done < <(find /etc/kubernetes/pki /etc/kubernetes/enc /var/lib/kubelet/pki \
+                      /var/backups/etcd -type f \
+                      \( -name '*.key' -o -name '*.pem' -o -path '/etc/kubernetes/enc/*' \
+                         -o -path '/var/backups/etcd/*' \) -print0 2>/dev/null)
+        {% for p in claude_ro_read_paths if p.perms != 'x' %}
+        if [ -e {{ p.path }} ] && ! runuser -u claude-ro -- test -r {{ p.path }}; then
+          echo "cannot read {{ p.path }}"; fail=1
+        fi
+        {% endfor %}
         exit $fail
       args:
         executable: /bin/bash
@@ -373,12 +463,14 @@
       delegate_to: localhost
       ansible.builtin.shell: |
         set -o pipefail
-        k="kubectl --kubeconfig {{ claude_ro_kubeconfig }}"
+        k=(kubectl --kubeconfig {{ claude_ro_kubeconfig | quote }})
         fail=0
-        $k get nodes >/dev/null || { echo "cannot list nodes"; fail=1; }
+        "${k[@]}" get nodes >/dev/null || { echo "cannot list nodes"; fail=1; }
         for check in "get secrets -A" "delete pods -A" "create pods/exec -A" \
                      "patch nodes" "create deployments -A" "get nodes/proxy"; do
-          [ "$($k auth can-i $check 2>/dev/null)" = "no" ] || { echo "allowed: $check"; fail=1; }
+          # $check is split on purpose: each one is a verb, resource and flags.
+          # shellcheck disable=SC2086
+          [ "$("${k[@]}" auth can-i $check 2>/dev/null)" = "no" ] || { echo "allowed: $check"; fail=1; }
         done
         exit $fail
       args:
