@@ -256,6 +256,13 @@
     # including an unexpected message from sudo-rs, which is the safe way to
     # be wrong. Credential checks cover every private key, not a sample, and
     # the readable paths are checked too so a lost grant shows up here.
+    #
+    # Readability is tested with bash's builtin `[ -r ]`, which asks the
+    # kernel (access(2)) and so honours ACLs. /usr/bin/test does not on
+    # Ubuntu 26.04: it is the Rust coreutils build, whose -r looks only at the
+    # mode bits. With it, a key made readable through an ACL would pass the
+    # credential checks, and an ACL grant (/var/backups/etcd) would look
+    # missing.
     - name: Verify claude-ro has no sudo, cannot read credentials, and can read its paths
       become: true
       become_method: ansible.builtin.sudo
@@ -269,8 +276,11 @@
         sudo_out=$(sudo -n -l -U claude-ro 2>&1 || true)
         printf '%s\n' "$sudo_out" | grep -qi 'not allowed' \
           || { echo "sudo -l -U claude-ro did not report 'not allowed': $sudo_out"; fail=1; }
+        ro_can_read() {
+          runuser -u claude-ro -- /bin/bash -c '[ -r "$1" ]' _ "$1"
+        }
         cannot_read() {
-          if runuser -u claude-ro -- test -r "$1"; then
+          if ro_can_read "$1"; then
             echo "can read $1"; fail=1
           fi
         }
@@ -287,7 +297,7 @@
                       \( -name '*.key' -o -name '*.pem' -o -path '/etc/kubernetes/enc/*' \
                          -o -path '/var/backups/etcd/*' \) -print0 2>/dev/null)
         {% for p in claude_ro_read_paths if p.perms != 'x' %}
-        if [ -e {{ p.path }} ] && ! runuser -u claude-ro -- test -r {{ p.path }}; then
+        if [ -e {{ p.path }} ] && ! ro_can_read {{ p.path }}; then
           echo "cannot read {{ p.path }}"; fail=1
         fi
         {% endfor %}
