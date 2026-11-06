@@ -183,7 +183,7 @@
       loop:
         - name: claude-ro-acl.service
           content: |
-            # {{ ansible_managed }}
+            # Managed by Ansible: playbooks/claude-readonly-access.yml
             [Unit]
             Description=Re-apply claude-ro read ACLs
 
@@ -192,7 +192,7 @@
             ExecStart=/usr/local/sbin/claude-ro-acl
         - name: claude-ro-acl.timer
           content: |
-            # {{ ansible_managed }}
+            # Managed by Ansible: playbooks/claude-readonly-access.yml
             [Unit]
             Description=Re-apply claude-ro read ACLs every 10 minutes
 
@@ -230,7 +230,7 @@
             group: root
             mode: "0644"
             content: |
-              # {{ ansible_managed }}
+              # Managed by Ansible: playbooks/claude-readonly-access.yml
               [Service]
               ExecStartPost=-/usr/local/sbin/claude-ro-acl
 
