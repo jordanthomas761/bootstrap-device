@@ -19,15 +19,24 @@ Pins live in `inventory/group_vars/all.yml` (`kubernetes_series`, `kubernetes_pa
 
 ## 2. Live cluster state (read-only)
 
-Run from the control plane if `kubectl` is not configured locally, e.g. `ssh control-plane.k8s.internal kubectl ...`. If the API server is down (during an upgrade window), say so and skip to the node-level checks instead of retrying.
+Use only the read-only access that `playbooks/claude-readonly-access.yml` sets up, never the user's own account or admin kubeconfig:
+
+- **Cluster:** `~/.local/bin/kubectl-ro <args>`. It is pinned to `~/.kube/claude-readonly.conf`, a ServiceAccount with get/list/watch only and no Secrets, exec, attach, port-forward or nodes/proxy. Wherever this step says `kubectl`, run `~/.local/bin/kubectl-ro`.
+- **Nodes:** `~/.local/bin/ssh-ro <cp-ro|gpio-ro|ml-ro> '<command>'`. These log in as `claude-ro`, which has no sudo. It is in `adm` and `systemd-journal`, and has read ACLs on the kubelet config, the static pod manifests, the apt and dist-upgrade logs, and the listing (not contents) of `/var/backups/etcd`.
+- Call both wrappers by that path; `~/.local/bin` is not on the Bash PATH. Never fall back to plain `ssh`, `kubectl` or `ansible`, even for a read-only command.
+- If a wrapper fails because its key or kubeconfig is missing, say so and ask the user to run `ansible-playbook -i inventory/hosts.yml playbooks/claude-readonly-access.yml` (`--tags ssh` works while the API is down).
+- Anything that needs root (`crictl`, `sudo` anything, the contents of etcd snapshots or `/etc/kubernetes/pki`) is out of reach on purpose. List it under **Gaps** with the exact command for the user to run.
+
+If the API server is down (during an upgrade window), say so and skip to the node-level checks instead of retrying.
 
 - `kubectl get nodes -o wide` – Ready/SchedulingDisabled, kubelet version, OS image, kernel, container runtime per node.
 - `kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded` – anything unhealthy.
 - `kubectl get pdb -A` – budgets that will block a drain.
 - `kubectl -n longhorn-system get volumes.longhorn.io` – volumes that are not `attached/healthy` or `detached/unknown`; degraded or faulted volumes make any node restart risky.
 - `kubectl get applications -n argocd` – OutOfSync or Degraded apps.
-- `cilium status` if the CLI is present.
-- Node-level on the control plane: `systemctl is-active etcd-snapshot.timer`, the newest file in `/var/backups/etcd`, `systemctl is-active containerd kubelet`, `apt-mark showhold`, `stat -fc %T /sys/fs/cgroup`, `[ -f /var/run/reboot-required ]`.
+- `kubectl -n kube-system get ds cilium cilium-envoy` and `kubectl -n kube-system get deploy cilium-operator`: desired versus ready. Do not use `cilium status`; parts of it exec into pods, which the read-only token cannot do.
+- Node-level on the control plane, through `ssh-ro cp-ro`: `systemctl is-active etcd-snapshot.timer`, the newest file in `/var/backups/etcd` (`ls -t`), `systemctl is-active containerd kubelet`, `apt-mark showhold`, `stat -fc %T /sys/fs/cgroup`, `[ -f /var/run/reboot-required ]`, `df -h /` (the kubelet evicts at 85% used), and `journalctl -u kubelet --since -30min` for eviction or pressure messages. Run the service, hold and reboot-required checks on the workers too, through `gpio-ro` and `ml-ro`.
+- When testing what `claude-ro` can read, use bash's builtin `[ -r ]`. On Ubuntu 26.04, `/usr/bin/test` is Rust coreutils and ignores ACLs.
 - Compare each node's kubelet version to the apiserver: kubelet must never be newer than the apiserver.
 
 ## 3. Search online for known issues
