@@ -67,11 +67,27 @@
 
     # The headless runner (playbooks/vm-runner.yml) has its own key, copied to a
     # group-readable file because its .ssh directory is private. Authorize it too
-    # if the runner has been installed; skipped quietly if not.
+    # if the runner has been installed. Installed but no readable key is an error,
+    # not a skip: authorized_keys is rewritten below, so a skip would drop the
+    # runner's key and its next shutdown would skip the cordon and the snapshot.
+    - name: Look for the headless runner
+      ansible.builtin.stat:
+        path: "/Library/LaunchDaemons/{{ vm_runner_label }}.plist"
+      register: vm_ctl_access_runner_plist
+
     - name: Look for the headless runner's public key
       ansible.builtin.stat:
         path: "{{ vm_runner_dir }}/vm-ctl.pub"
       register: vm_ctl_access_runner_pub
+
+    - name: Require the runner's key when the runner is installed
+      ansible.builtin.assert:
+        that: vm_ctl_access_runner_pub.stat.exists and vm_ctl_access_runner_pub.stat.readable
+        fail_msg: >-
+          The headless runner is installed but {{ vm_runner_dir }}/vm-ctl.pub is
+          missing or unreadable by {{ ansible_user_id }}. Run playbooks/vm-runner.yml
+          first; it creates the key and publishes it there.
+      when: vm_ctl_access_runner_plist.stat.exists
 
     - name: Read the runner's public key
       ansible.builtin.slurp:

@@ -858,6 +858,14 @@ NIC name, and a QMP `system_powerdown` makes the guest shut down cleanly.
 
 **Start:** preflight, QEMU through `socket_vmnet_client`, then, once the API
 answers, `vm-ctl uncordon` releases nodes the last shutdown cordoned.
+**No network:** `socket_vmnet` can hang while setting up vmnet after a reboot
+(its log stops at `Using network interface "en0"`) while its socket file still
+exists, so the VM boots unreachable. If the guest does not answer ping within
+180 s, the runner restarts `socket_vmnet` (its only sudo right, in
+`/etc/sudoers.d/vm-runner`), powers the guest off and exits 1, and launchd starts
+it again. After three such starts in a row it stops and logs `NOT STARTING`;
+fix the cause, then `sudo rm /opt/vm-runner/controlplane/net-failures` and
+kickstart it.
 **Stop** (SIGTERM from launchd at restart or shutdown): `vm-ctl cordon`, `vm-ctl
 snapshot` (verified etcd snapshot shipped to the NAS), then the virtual power
 button (ACPI) and a wait for the guest to power itself off. It takes about two
@@ -963,6 +971,10 @@ pinned `vm_machine` afterwards.
 - **The socket is open to the `staff` group.** Every normal local account is in
   `staff`, so any of them can join `en0` at layer 2. Tighten it with a dedicated
   group if `socket_vmnet --help` offers one.
+- **Only the start is watched for network loss.** If `socket_vmnet` dies while
+  the VM is running, nothing notices; restart both by hand
+  (`sudo launchctl kickstart -k system/io.github.lima-vm.socket_vmnet.bridged.en0`,
+  then stop and start the runner).
 - **The shutdown is best effort at a system shutdown**: macOS can cut a daemon's
   `ExitTimeOut` short. The 6-hourly etcd snapshot timer is the backstop.
 

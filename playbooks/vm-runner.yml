@@ -141,6 +141,26 @@
         group: wheel
         mode: "0755"
 
+    # socket_vmnet can hang during vmnet setup after a reboot while its socket
+    # file still exists, so the VM boots with no network. The runner is not root,
+    # so it gets one sudo rule: restart that one daemon, with those exact
+    # arguments. macOS's /etc/sudoers reads /private/etc/sudoers.d.
+    - name: Check that sudoers.d is read
+      ansible.builtin.command:
+        argv: [grep, -Eq, '^[#@]includedir /private/etc/sudoers.d', /etc/sudoers]
+      changed_when: false
+
+    - name: Let the runner restart socket_vmnet, and nothing else
+      ansible.builtin.copy:
+        dest: /private/etc/sudoers.d/vm-runner
+        content: |
+          # Managed by playbooks/vm-runner.yml
+          {{ vm_runner_user }} ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/{{ vm_socket_vmnet_label }}
+        owner: root
+        group: wheel
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
     - name: Install the LaunchDaemon
       ansible.builtin.template:
         src: templates/vm-runner.plist.j2

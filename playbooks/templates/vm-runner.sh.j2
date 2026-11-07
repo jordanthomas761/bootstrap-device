@@ -5,8 +5,12 @@
 # unprivileged service user; QEMU gets its bridged network through the root
 # socket_vmnet helper's unix socket, so nothing here needs root.
 #
-#   start: preflight, launch QEMU, then (in the background) wait for the API and
-#          uncordon the nodes the last shutdown cordoned.
+#   start: preflight, launch QEMU, then (in the background) check the guest is
+#          on the network, wait for the API and uncordon the nodes the last
+#          shutdown cordoned.
+#   no network: if the guest never answers ping, restart socket_vmnet (one
+#          sudoers rule allows exactly that), power the guest off and exit 1 so
+#          launchd starts the VM again on a working helper.
 #   stop:  on SIGTERM (launchd at shutdown/restart or `launchctl bootout`) cordon
 #          the nodes, take a verified etcd snapshot, press the VM's virtual power
 #          button (ACPI), and wait for the guest to power itself off.
@@ -22,10 +26,15 @@ QEMU="{{ vm_qemu_bin }}"
 CLIENT="{{ vm_socket_vmnet_client }}"
 VMNET_SOCK="{{ vm_socket_vmnet_socket }}"
 QMP="$DIR/qmp.sock"
-CP="{{ vm_ctl_user }}@{{ cluster_cp_host }}"
+CP_HOST="{{ cluster_cp_host }}"
+CP="{{ vm_ctl_user }}@$CP_HOST"
 KEY="$DIR/.ssh/id_ed25519_vm_ctl"
 STOP_TIMEOUT={{ vm_runner_stop_timeout }}
 BOOT_TIMEOUT={{ vm_runner_boot_timeout }}
+NET_TIMEOUT={{ vm_runner_net_timeout }}
+VMNET_LABEL="{{ vm_socket_vmnet_label }}"
+NET_FAILS_FILE="$DIR/net-failures"
+MAX_NET_FAILS={{ vm_runner_max_net_failures }}
 
 log() { echo "[vm-runner] $(date '+%F %T') $*"; }
 refuse() { log "NOT STARTING: $*"; exit 0; }
@@ -50,6 +59,13 @@ qmp() {
 if pgrep -f "qemu-system-aarch64.*-name $NAME" >/dev/null 2>&1 || pgrep -f 'qemu-aarch64-softmmu' >/dev/null 2>&1; then
   refuse "another QEMU for this VM, or a UTM VM, is already running"
 fi
+# Consecutive starts that ended with no network. Past the limit, a restart loop
+# is not going to fix it.
+net_fails=$(cat "$NET_FAILS_FILE" 2>/dev/null || echo 0)
+case "$net_fails" in ''|*[!0-9]*) net_fails=0 ;; esac
+if [ "$net_fails" -ge "$MAX_NET_FAILS" ]; then
+  refuse "the guest had no network on the last $net_fails starts. Check socket_vmnet (/var/log/socket_vmnet/) and en0, then: rm $NET_FAILS_FILE; sudo launchctl kickstart system/{{ vm_runner_label }}"
+fi
 for f in "$DIR/disk.qcow2" "$DIR/efi_vars.fd" "$DIR/edk2-aarch64-code.fd"; do
   [ -r "$f" ] || refuse "cannot read $f (is the cutover done, and owned by the service user?)"
 done
@@ -62,6 +78,7 @@ done
 
 # --- start -------------------------------------------------------------------
 rm -f "$QMP"
+started=$SECONDS
 log "starting QEMU for '$NAME' ({{ vm_machine }}, {{ vm_cpus }} CPU, {{ vm_memory_mb }} MB)"
 # Device order matters: the NIC must be the first PCI device, or the guest sees
 # it as enp0s2 and netplan (bound to the name enp0s1) leaves it unconfigured.
@@ -80,17 +97,12 @@ log "starting QEMU for '$NAME' ({{ vm_machine }}, {{ vm_cpus }} CPU, {{ vm_memor
 QPID=$!
 
 # --- stop --------------------------------------------------------------------
-# shellcheck disable=SC2329  # invoked through the trap below
-graceful_stop() {
-  log "stop requested"
-  if ctl ping >/dev/null 2>&1; then
-    log "cordoning nodes and taking a verified etcd snapshot"
-    ctl cordon || log "WARNING: cordon failed; continuing"
-    ctl snapshot || log "WARNING: snapshot failed; powering off anyway"
-  else
-    log "WARNING: cannot reach the guest over SSH; skipping cordon and snapshot"
-  fi
+WATCHER=""
+stop_watcher() { [ -n "$WATCHER" ] && kill "$WATCHER" 2>/dev/null; }
 
+# ACPI power button, then wait for the guest to power itself off.
+# shellcheck disable=SC2329  # called from the traps below
+power_off() {
   log "pressing the virtual power button (ACPI)"
   qmp system_powerdown
 
@@ -105,23 +117,65 @@ graceful_stop() {
     sleep 2
     waited=$((waited + 2))
   done
+}
+
+# shellcheck disable=SC2329  # invoked through the trap below
+graceful_stop() {
+  log "stop requested"
+  stop_watcher
+  if ctl ping >/dev/null 2>&1; then
+    log "cordoning nodes and taking a verified etcd snapshot"
+    ctl cordon || log "WARNING: cordon failed; continuing"
+    ctl snapshot || log "WARNING: snapshot failed; powering off anyway"
+  else
+    log "WARNING: cannot reach the guest over SSH; skipping cordon and snapshot"
+  fi
+  power_off
   log "stopped"
   exit 0
 }
 trap graceful_stop TERM INT HUP
 
-# --- after boot: undo the previous shutdown's cordon -------------------------
+# Sent by the watcher below when the guest never reached the network. The guest
+# has no network, so there is nothing to cordon or snapshot; just power it off.
+# Exit 1 so launchd (KeepAlive on failure) starts the VM again.
+# shellcheck disable=SC2329  # invoked through the trap below
+network_failed() {
+  power_off
+  log "stopped after a network failure; launchd will start it again"
+  exit 1
+}
+trap network_failed USR1
+
+# --- after boot: check the network, then undo the previous shutdown's cordon --
+# ping, not ssh, so a key problem is not mistaken for a network one.
+RUNNER=$$
 (
+  until ping -c 1 -t 2 "$CP_HOST" >/dev/null 2>&1; do
+    if [ $((SECONDS - started)) -ge "$NET_TIMEOUT" ]; then
+      echo $((net_fails + 1)) >"$NET_FAILS_FILE"
+      log "ERROR: guest not reachable after ${NET_TIMEOUT}s (failure $((net_fails + 1)) of $MAX_NET_FAILS); restarting socket_vmnet"
+      sudo -n /bin/launchctl kickstart -k "system/$VMNET_LABEL" || log "WARNING: could not restart socket_vmnet"
+      kill -USR1 "$RUNNER"
+      exit 0
+    fi
+    sleep 3
+  done
+  rm -f "$NET_FAILS_FILE"
+  log "guest is on the network"
+
   until ctl ready >/dev/null 2>&1; do
-    [ "$SECONDS" -lt "$BOOT_TIMEOUT" ] || { log "API not ready after ${BOOT_TIMEOUT}s; leaving nodes as they are"; exit 0; }
+    [ $((SECONDS - started)) -lt "$BOOT_TIMEOUT" ] || { log "API not ready after ${BOOT_TIMEOUT}s; leaving nodes as they are"; exit 0; }
     sleep 5
   done
   log "API ready; uncordoning nodes that the last shutdown cordoned"
   ctl uncordon || log "WARNING: uncordon failed"
 ) &
+WATCHER=$!
 
 # --- run until QEMU exits ----------------------------------------------------
 wait "$QPID"
 rc=$?
+stop_watcher
 log "QEMU exited with status $rc"
 exit "$rc"
