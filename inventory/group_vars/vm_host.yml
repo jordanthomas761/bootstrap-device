@@ -37,3 +37,70 @@ vm_startup_timeout: 600
 # How long launchd lets the shutdown hook run after SIGTERM before SIGKILL.
 # macOS may still cut a real system shutdown shorter than this; see the README.
 vm_hook_exit_timeout: 240
+
+# ---------------------------------------------------------------------------
+# Headless QEMU runner (playbooks/vm-runner.yml). Replaces running the VM in UTM:
+# a boot-time LaunchDaemon supervises QEMU as an unprivileged service user, so
+# the VM starts with nobody logged in. See "Headless control-plane VM" in the
+# README, including the manual cutover steps.
+# ---------------------------------------------------------------------------
+
+# Unprivileged, hidden, no login shell. macOS role accounts live below UID 500;
+# 399 must simply be free (`dscl . -list /Users UniqueID | sort -k2 -n`).
+vm_runner_user: _vmrunner
+vm_runner_uid: 399
+vm_runner_group: staff
+# Not under /var: /private/var/vm belongs to macOS (swap and sleep image) and
+# was cleared by a restart, taking the VM disk with it.
+vm_runner_home: /opt/vm-runner
+# Disk, EFI variables, firmware copy, QMP socket, serial log and the runner's
+# own ssh key all live here. 0750, owned by the runner.
+vm_runner_dir: /opt/vm-runner/controlplane
+# Root-owned, so the service user cannot rewrite the script launchd runs.
+vm_runner_bin_dir: /opt/vm-runner/bin
+vm_runner_label: local.homelab.vm-runner
+# false: install everything but do not start it. The cutover sets this to true
+# once the VM files are in place and the old VM is stopped.
+vm_runner_load: false
+
+vm_qemu_bin: /opt/homebrew/bin/qemu-system-aarch64
+vm_socket_vmnet_client: /opt/socket_vmnet/bin/socket_vmnet_client
+vm_socket_vmnet_socket: /var/run/socket_vmnet.bridged.en0
+# Its LaunchDaemon. The runner restarts exactly this job before every start,
+# through one sudoers rule: after a reboot it can hang setting up vmnet.
+vm_socket_vmnet_label: io.github.lima-vm.socket_vmnet.bridged.en0
+# The Mac interface it bridges; the runner waits for it to have an address.
+vm_host_iface: en0
+# The runner reaches the guest by IP so a resolver that is not up at boot does
+# not look like a dead network. Empty: resolve cluster_cp_host on the Mac when
+# the playbook runs (the MAC pins the DHCP lease). Set it if the lease moves.
+vm_guest_ip: ""
+
+# The VM's identity, copied from the UTM VM it replaces (`ps` on the running UTM
+# QEMU, or its config.plist). Keep them identical: the MAC fixes the DHCP lease,
+# and netplan binds the NIC by name (enp0s1), so the NIC must stay the first PCI
+# device. The machine type is pinned to what UTM's QEMU used (`virt-10.0`, read
+# from /sys/class/dmi/id/product_version in the guest) so the hardware layout,
+# and therefore the NIC name, does not move when Homebrew's QEMU upgrades.
+vm_name: controlplane
+vm_uuid: BD16EC84-0059-4B6B-8DA3-80EAA355C4E2
+vm_mac: "02:D1:F1:40:83:30"
+vm_disk_serial: 79907F457E1249D48CDD
+vm_machine: virt-10.0
+vm_cpus: 4
+vm_memory_mb: 8192
+
+# Seconds. The guest takes ~90 s to stop on its own because kube-apiserver does
+# not exit on SIGTERM promptly; launchd must allow for that plus the snapshot.
+vm_runner_stop_timeout: 240
+vm_runner_exit_timeout: 300
+# How long to wait for the API after boot before giving up on the auto-uncordon.
+vm_runner_boot_timeout: 600
+# Once the guest's serial console shows its login prompt, it should answer ping
+# within seconds. If it still has not after this long, the network path is
+# broken: the runner powers the guest off and exits non-zero so launchd starts it
+# again on a freshly restarted socket_vmnet. A guest still booting (no login
+# prompt yet) is never treated this way. After this many such starts in a row
+# it stops trying and waits for a person.
+vm_runner_net_timeout: 120
+vm_runner_max_net_failures: 3

@@ -65,6 +65,41 @@
       ansible.builtin.set_fact:
         vm_ctl_pubkey: "{{ (vm_ctl_access_pubkey.content | b64decode) | trim }}"
 
+    # The headless runner (playbooks/vm-runner.yml) has its own key, copied to a
+    # world-readable file because the runner's directory is private. Authorize it too
+    # if the runner has been installed. Installed but no readable key is an error,
+    # not a skip: authorized_keys is rewritten below, so a skip would drop the
+    # runner's key and its next shutdown would skip the cordon and the snapshot.
+    - name: Look for the headless runner
+      ansible.builtin.stat:
+        path: "/Library/LaunchDaemons/{{ vm_runner_label }}.plist"
+      register: vm_ctl_access_runner_plist
+
+    - name: Look for the headless runner's public key
+      ansible.builtin.stat:
+        path: "{{ vm_runner_home }}/vm-ctl.pub"
+      register: vm_ctl_access_runner_pub
+
+    - name: Require the runner's key when the runner is installed
+      ansible.builtin.assert:
+        that: vm_ctl_access_runner_pub.stat.exists and vm_ctl_access_runner_pub.stat.readable
+        fail_msg: >-
+          The headless runner is installed but {{ vm_runner_home }}/vm-ctl.pub is
+          missing or unreadable by {{ ansible_user_id }}. Run playbooks/vm-runner.yml
+          first; it creates the key and publishes it there.
+      when: vm_ctl_access_runner_plist.stat.exists or vm_ctl_access_runner_pub.stat.exists
+
+    - name: Read the runner's public key
+      ansible.builtin.slurp:
+        src: "{{ vm_runner_home }}/vm-ctl.pub"
+      register: vm_ctl_access_runner_key
+      when: vm_ctl_access_runner_pub.stat.exists
+
+    - name: Remember it for the control-plane play
+      ansible.builtin.set_fact:
+        vm_runner_pubkey: "{{ (vm_ctl_access_runner_key.content | b64decode) | trim }}"
+      when: vm_ctl_access_runner_pub.stat.exists
+
 - name: Create the restricted vm-ctl user on the control plane
   hosts: control_plane
   become: true
@@ -126,12 +161,22 @@
         group: root
         mode: "0755"
 
-    - name: Authorize the Mac's key, restricted to the forced command
+    # The Mac user's key, plus the headless runner's when it exists. Both are
+    # restricted to the same forced command.
+    - name: Work out which keys to authorize
+      ansible.builtin.set_fact:
+        vm_ctl_access_keys: >-
+          {{ [hostvars[groups['vm_host'][0]].vm_ctl_pubkey]
+          + ([hostvars[groups['vm_host'][0]].vm_runner_pubkey]
+          if hostvars[groups['vm_host'][0]].vm_runner_pubkey is defined else []) }}
+
+    - name: Authorize the keys, restricted to the forced command
       ansible.builtin.copy:
         dest: "/home/{{ vm_ctl_user }}/.ssh/authorized_keys"
-        content: >-
-          restrict,command="{{ vm_ctl_ssh_bin }}"
-          {{ hostvars[groups['vm_host'][0]].vm_ctl_pubkey }}
+        content: |
+          {% for key in vm_ctl_access_keys %}
+          restrict,command="{{ vm_ctl_ssh_bin }}" {{ key }}
+          {% endfor %}
         owner: root
         group: root
         mode: "0644"

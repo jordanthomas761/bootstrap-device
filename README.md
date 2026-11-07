@@ -840,6 +840,156 @@ To add a verb, add it to `vm_ctl_verbs`, give it a branch in
   fully documented, so the scripts match `stopped`/`started` loosely and only
   use `stop --request` after confirming this `utmctl` lists it.
 
+## Headless Control-Plane VM (QEMU)
+
+UTM needs a logged-in desktop and `utmctl` cannot run over SSH, so the VM only
+came up after someone logged in. `playbooks/vm-runner.yml` replaces UTM with plain
+QEMU supervised by a boot-time LaunchDaemon, so the VM starts with nobody logged
+in. It was proven by hand first (see the headless-runner issue): Homebrew QEMU
+11.1 with `-accel hvf` runs as a normal user, keeps the VM's MAC and the `enp0s1`
+NIC name, and a QMP `system_powerdown` makes the guest shut down cleanly.
+
+| Piece | What it is |
+|---|---|
+| `socket_vmnet` bridged daemon | the only root piece: owns the vmnet interface on `en0` and exposes a unix socket |
+| `_vmrunner` | hidden, no-login service user that owns the VM files and runs QEMU |
+| `/opt/vm-runner/bin/vm-runner` | root-owned supervisor script |
+| `local.homelab.vm-runner` | boot-time LaunchDaemon that runs it as `_vmrunner` |
+
+**Start:** preflight, wait for `en0` to have an address, restart `socket_vmnet`
+and wait for its fresh socket, then QEMU through `socket_vmnet_client`. Once the
+guest answers ping and the API is ready, `vm-ctl uncordon` releases the nodes
+the last shutdown cordoned. The restart is there because, after a reboot,
+`socket_vmnet` can hang while setting up vmnet (its log stops at `Using network
+interface "en0"`) with its socket file still in place, and a VM started on it
+has no network. Restarting it is the runner's only sudo right
+(`/etc/sudoers.d/vm-runner`). The runner reaches the guest by IP, resolved when
+the playbook runs (`vm_guest_ip` overrides it), so DNS is not needed at boot.
+**No network anyway:** if the guest reaches its serial login prompt but still
+does not answer ping 120 s later, the runner powers it off and exits 1, and
+launchd starts it again. A guest that is only slow to boot (no login prompt yet)
+is left alone. After three such starts in a row it stops and logs
+`NOT STARTING`; fix the cause, then
+`sudo rm /opt/vm-runner/controlplane/net-failures` and kickstart it.
+**Not ready yet** (`en0` without an address, `socket_vmnet` not back): exits 1,
+and launchd tries again every 30 s. Problems a person has to fix (missing VM
+files, another QEMU or UTM VM running) log `NOT STARTING` and stay off.
+**Stop** (SIGTERM from launchd at restart or shutdown): `vm-ctl cordon`, `vm-ctl
+snapshot` (verified etcd snapshot shipped to the NAS), then the virtual power
+button (ACPI) and a wait for the guest to power itself off. It takes about two
+minutes, because kube-apiserver does not exit on SIGTERM promptly, so the stop
+timeout is 240 s and launchd's `ExitTimeOut` is 300 s.
+
+### Prerequisites
+
+- `brew install qemu`
+- `socket_vmnet` from a **root-owned** prefix, not Homebrew's build (its README
+  warns that admin-group users can replace a binary root runs). Verify the
+  release before installing it:
+  ```bash
+  VERSION="$(curl -fsSL https://api.github.com/repos/lima-vm/socket_vmnet/releases/latest | jq -r .tag_name)"
+  FILE="socket_vmnet-${VERSION:1}-$(uname -m).tar.gz"
+  curl -OSL "https://github.com/lima-vm/socket_vmnet/releases/download/${VERSION}/${FILE}"
+  gh attestation verify --owner=lima-vm "${FILE}"
+  sudo tar Cxzvf / "${FILE}" opt/socket_vmnet
+  SERVICE_ID=io.github.lima-vm.socket_vmnet.bridged.en0
+  sudo cp /opt/socket_vmnet/share/doc/socket_vmnet/launchd/$SERVICE_ID.plist /Library/LaunchDaemons/
+  sudo launchctl bootstrap system /Library/LaunchDaemons/$SERVICE_ID.plist
+  ```
+  The socket appears as `/var/run/socket_vmnet.bridged.en0`, mode `0660`, group
+  `staff`; the log is `/var/log/socket_vmnet/bridged.en0.stderr`.
+- The VM's identity (`vm_mac`, `vm_uuid`, `vm_disk_serial`, `vm_machine`) in
+  `inventory/group_vars/vm_host.yml` matches the UTM VM it replaces.
+
+### Install, then cut over
+
+```bash
+# 1. Install only. Nothing starts. Creates the user, directories, runner key and daemon.
+ansible-playbook -i inventory/hosts.yml playbooks/vm-runner.yml -K
+# 2. Authorize the runner's key as the restricted vm-ctl user on the control plane.
+ansible-playbook -i inventory/hosts.yml playbooks/vm-ctl-access.yml
+```
+
+Then the cutover, by hand, with the cluster quiet. **Clone from whichever disk the
+live control plane is using, not from UTM's folder by default**: if the VM has
+been running under hand-started QEMU (the spike), UTM's copy is hours or days
+stale, and cloning it would throw that state away.
+
+1. Take an etcd snapshot (`ssh … 'sudo systemctl start etcd-snapshot.service'`)
+   and stop the live VM cleanly, then confirm nothing is running
+   (`pgrep -fl qemu`). Under hand-started QEMU, press its virtual power button
+   and wait for the process to exit; under UTM, `sudo poweroff` in the guest:
+   ```bash
+   printf '{"execute":"qmp_capabilities"}\n{"execute":"system_powerdown"}\n' | nc -U ~/vm-spike/qmp.sock
+   ```
+2. Clone the VM files into the runner's directory (instant on APFS, no extra
+   space), from the directory the live VM used. `SRC` is `~/vm-spike` for the
+   hand-started QEMU, whose firmware copy already matches its EFI variables:
+   ```bash
+   SRC=~/vm-spike
+   D=/opt/vm-runner/controlplane
+   sudo cp -c "$SRC/control-plane.qcow2" "$D/disk.qcow2"
+   sudo cp -c "$SRC/efi_vars.fd" "$D/efi_vars.fd"
+   sudo cp -c "$SRC/edk2-aarch64-code.fd" "$D/"
+   sudo chown _vmrunner:staff "$D"/disk.qcow2 "$D"/efi_vars.fd "$D"/edk2-aarch64-code.fd
+   sudo chmod 0600 "$D"/disk.qcow2 "$D"/efi_vars.fd
+   ```
+   Only if the UTM VM was the live one, use its files instead:
+   `…/Documents/control-plane.utm/Data/*.qcow2` and `efi_vars.fd`, plus
+   `…/Library/Caches/qemu/edk2-aarch64-code.fd`, all under
+   `~/Library/Containers/com.utmapp.UTM/Data`.
+3. Load the daemon. This also retires the UTM LaunchAgents from
+   `vm-host-lifecycle.yml`, whose login agent would otherwise start the stale UTM
+   VM next to this one:
+   ```bash
+   ansible-playbook -i inventory/hosts.yml playbooks/vm-runner.yml -K -e vm_runner_load=true
+   ```
+4. Check: `sudo tail -f /opt/vm-runner/controlplane/runner.log`, then `kubectl get nodes`.
+
+**From then on the QEMU VM is the source of truth.** The original UTM disk is
+stale and must not be started casually: it would share the MAC and IP with the
+runner's VM, and the runner refuses to start while any UTM VM is running.
+
+**Rolling back** (only worthwhile soon after the cutover, since the UTM disk does not follow the cluster): stop the daemon
+(`sudo launchctl kill TERM system/local.homelab.vm-runner`, wait for it to
+finish), then start the UTM VM, which still holds the pre-cutover disk.
+
+### Day to day
+
+```bash
+sudo launchctl kill TERM system/local.homelab.vm-runner   # graceful stop (cordon, snapshot, ACPI)
+sudo launchctl kickstart system/local.homelab.vm-runner   # start it again
+sudo tail -f /opt/vm-runner/controlplane/runner.log      # supervisor
+sudo tail -f /opt/vm-runner/controlplane/serial.log      # guest firmware/serial output
+```
+
+The runner's directory is `0700`, so reading its logs needs `sudo`. A clean guest
+poweroff, or a stop as above, exits 0 and stays off; launchd only restarts the
+job if QEMU or the supervisor fails. Rerunning the playbook with
+`vm_runner_load=true` only reloads the daemon (a full graceful stop and start)
+when its plist changed; a changed script takes effect at the next start. Stop it before upgrading
+Homebrew's QEMU, and check `qemu-system-aarch64 -machine help` still lists the
+pinned `vm_machine` afterwards.
+
+### What it cannot do
+
+- **FileVault on the Mac.** After a power cut or an unplanned reboot the Mac waits
+  at the FileVault unlock screen and nothing runs, daemons included, until
+  someone unlocks it. A restart that skips the unlock screen (an authenticated
+  restart, as macOS updates are expected to use) boots straight to the login
+  window, and system daemons start from there without a login. Whether a given
+  update restart is authenticated is something to confirm on the first update.
+- **The socket is open to the `staff` group.** Every normal local account is in
+  `staff`, so any of them can join `en0` at layer 2. Tighten it with a dedicated
+  group if `socket_vmnet --help` offers one.
+- **Only the start is watched for network loss.** If `socket_vmnet` dies while
+  the VM is running, nothing notices; stop and start the runner (its start
+  restarts `socket_vmnet` too).
+- **The guest's IP is fixed at install time.** It comes from the DHCP lease the
+  MAC pins; if that ever moves, rerun the playbook or set `vm_guest_ip`.
+- **The shutdown is best effort at a system shutdown**: macOS can cut a daemon's
+  `ExitTimeOut` short. The 6-hourly etcd snapshot timer is the backstop.
+
 ## What Gets Configured
 
 ### System Setup
@@ -892,6 +1042,7 @@ To add a verb, add it to `vm_ctl_verbs`, give it a branch in
     ├── machine-learning.yml      # ML tools and libraries
     ├── mlx-inference.yml         # mlx-openai-server on pi.dev as a launchd daemon (run on demand, not via main.yml)
     ├── vm-ctl-access.yml         # Restricted vm-ctl user on the control plane (fixed verbs only) + the UTM host's key; run before vm-host-lifecycle.yml
+    ├── vm-runner.yml             # Headless QEMU runner for the control-plane VM: service user, boot-time LaunchDaemon (install; cutover is manual, see README)
     ├── vm-host-lifecycle.yml     # Installs cluster-shutdown / cluster-startup + launchd agents on the UTM host Mac (run on demand, not via main.yml)
     ├── argocd-dex-sso.yml        # Patches argocd-cm/argocd-secret for Dex SSO (run on demand, not via main.yml)
     ├── etcd-encryption-at-rest.yml # Encrypts Secrets at rest in etcd (run on demand, not via main.yml)
