@@ -3,21 +3,27 @@
 #
 # Supervises QEMU for the control-plane VM. launchd runs this at boot as an
 # unprivileged service user; QEMU gets its bridged network through the root
-# socket_vmnet helper's unix socket, so nothing here needs root.
+# socket_vmnet helper's unix socket. The one root action it may take is
+# restarting that helper (a single exact-argument sudoers rule).
 #
-#   start: preflight, launch QEMU, then (in the background) check the guest is
-#          on the network, wait for the API and uncordon the nodes the last
-#          shutdown cordoned.
-#   no network: if the guest never answers ping, restart socket_vmnet (one
-#          sudoers rule allows exactly that), power the guest off and exit 1 so
-#          launchd starts the VM again on a working helper.
+#   start: preflight; wait for the Mac's own network; restart socket_vmnet so
+#          it sets up vmnet on a network that is up (after a reboot it can hang
+#          half-initialised while its socket file still exists); launch QEMU.
+#          In the background: wait for the guest to boot and answer ping, then
+#          for the API, then uncordon the nodes the last shutdown cordoned.
+#   no network: if the guest reaches its login prompt but still does not answer
+#          ping, power it off and exit 1 so launchd starts it again (with a fresh
+#          socket_vmnet). A guest that is merely slow to boot is left alone.
 #   stop:  on SIGTERM (launchd at shutdown/restart or `launchctl bootout`) cordon
 #          the nodes, take a verified etcd snapshot, press the VM's virtual power
 #          button (ACPI), and wait for the guest to power itself off.
 #
-# Preflight problems exit 0 on purpose: with KeepAlive set to restart only on
-# failure, a "not ready" refusal must not turn into a restart loop. Fix the
-# cause, then `sudo launchctl kickstart system/{{ vm_runner_label }}`.
+# Exit codes and launchd (KeepAlive restarts on failure only):
+#   0  clean stop, or a problem a person has to fix (refuse): stays off.
+#   1  transient (boot ordering, no network yet): launchd retries after
+#      ThrottleInterval.
+# After a refusal, fix the cause, then
+# `sudo launchctl kickstart system/{{ vm_runner_label }}`.
 set -uo pipefail
 
 NAME="{{ vm_name }}"
@@ -25,59 +31,99 @@ DIR="{{ vm_runner_dir }}"
 QEMU="{{ vm_qemu_bin }}"
 CLIENT="{{ vm_socket_vmnet_client }}"
 VMNET_SOCK="{{ vm_socket_vmnet_socket }}"
+VMNET_LABEL="{{ vm_socket_vmnet_label }}"
+IFACE="{{ vm_host_iface }}"
 QMP="$DIR/qmp.sock"
-CP_HOST="{{ cluster_cp_host }}"
-CP="{{ vm_ctl_user }}@$CP_HOST"
+SERIAL="$DIR/serial.log"
+# By address, not name: a resolver that is not up yet at boot must not look
+# like a guest with no network. The address is resolved when the playbook runs.
+GUEST_IP="{{ vm_runner_guest_ip }}"
+CP="{{ vm_ctl_user }}@$GUEST_IP"
 KEY="$DIR/.ssh/id_ed25519_vm_ctl"
 STOP_TIMEOUT={{ vm_runner_stop_timeout }}
 BOOT_TIMEOUT={{ vm_runner_boot_timeout }}
 NET_TIMEOUT={{ vm_runner_net_timeout }}
-VMNET_LABEL="{{ vm_socket_vmnet_label }}"
 NET_FAILS_FILE="$DIR/net-failures"
 MAX_NET_FAILS={{ vm_runner_max_net_failures }}
+UNCORDONING="$DIR/uncordoning"
+QEMU_PATTERN="qemu-system-aarch64.*-name $NAME"
+
+# Absolute paths: a Homebrew nc, ssh or ping earlier on PATH must not change
+# behaviour (GNU netcat has no -U, and QMP errors are deliberately silent).
+NC=/usr/bin/nc
+SSH=/usr/bin/ssh
+PING=/sbin/ping
+PGREP=/usr/bin/pgrep
+PKILL=/usr/bin/pkill
+STAT=/usr/bin/stat
+SUDO=/usr/bin/sudo
+IPCONFIG=/usr/sbin/ipconfig
 
 log() { echo "[vm-runner] $(date '+%F %T') $*"; }
 refuse() { log "NOT STARTING: $*"; exit 0; }
+retry_later() { log "NOT READY (launchd will retry): $*"; exit 1; }
 
 # The vm-ctl account can run only fixed verbs (ping, snapshot, cordon, uncordon,
 # ready, ...); see playbooks/vm-ctl-access.yml. There is no shell on the far end.
 ctl() {
-  ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+  "$SSH" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
     -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$DIR/.ssh/known_hosts" \
     "$CP" "$@"
 }
 
 # One QMP command (ACPI power button, or a last-resort quit).
-# shellcheck disable=SC2329  # called from graceful_stop, which runs via trap
+# shellcheck disable=SC2329  # called from the traps below
 qmp() {
-  printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$1" | nc -U -w 3 "$QMP" >/dev/null 2>&1
+  printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$1" | "$NC" -U -w 3 "$QMP" >/dev/null 2>&1
 }
 
+sock_id() { "$STAT" -f '%i %B' "$VMNET_SOCK" 2>/dev/null || true; }
+
 # --- preflight ---------------------------------------------------------------
-# Two machines with one MAC and one disk would corrupt the cluster, so refuse if
-# any QEMU for this VM, or any UTM-hosted VM, is already running.
-if pgrep -f "qemu-system-aarch64.*-name $NAME" >/dev/null 2>&1 || pgrep -f 'qemu-aarch64-softmmu' >/dev/null 2>&1; then
-  refuse "another QEMU for this VM, or a UTM VM, is already running"
-fi
+# Two machines with one MAC and one disk would corrupt the cluster. A previous
+# instance may still be finishing its shutdown (a reload), so give it a minute.
+waited=0
+while "$PGREP" -f "$QEMU_PATTERN" >/dev/null 2>&1 || "$PGREP" -f 'qemu-aarch64-softmmu' >/dev/null 2>&1; do
+  [ "$waited" -lt 60 ] || refuse "another QEMU for this VM, or a UTM VM, is already running"
+  sleep 2
+  waited=$((waited + 2))
+done
+
 # Consecutive starts that ended with no network. Past the limit, a restart loop
 # is not going to fix it.
 net_fails=$(cat "$NET_FAILS_FILE" 2>/dev/null || echo 0)
-case "$net_fails" in ''|*[!0-9]*) net_fails=0 ;; esac
+case "$net_fails" in '' | *[!0-9]*) net_fails=0 ;; esac
 if [ "$net_fails" -ge "$MAX_NET_FAILS" ]; then
-  refuse "the guest had no network on the last $net_fails starts. Check socket_vmnet (/var/log/socket_vmnet/) and en0, then: rm $NET_FAILS_FILE; sudo launchctl kickstart system/{{ vm_runner_label }}"
+  refuse "the guest had no network on the last $net_fails starts. Check socket_vmnet (/var/log/socket_vmnet/) and $IFACE, then: sudo rm $NET_FAILS_FILE; sudo launchctl kickstart system/{{ vm_runner_label }}"
 fi
+
 for f in "$DIR/disk.qcow2" "$DIR/efi_vars.fd" "$DIR/edk2-aarch64-code.fd"; do
   [ -r "$f" ] || refuse "cannot read $f (is the cutover done, and owned by the service user?)"
 done
+
+# The bridge needs the Mac's own interface up first.
 waited=0
-until [ -S "$VMNET_SOCK" ]; do
-  [ "$waited" -lt 120 ] || refuse "socket_vmnet socket $VMNET_SOCK is not up"
+until "$IPCONFIG" getifaddr "$IFACE" >/dev/null 2>&1; do
+  [ "$waited" -lt 120 ] || retry_later "$IFACE has no address yet"
+  sleep 2
+  waited=$((waited + 2))
+done
+
+# Restart socket_vmnet now that the network is up, and wait for its new socket
+# (a new file, not the one left by the previous instance).
+old_sock=$(sock_id)
+log "restarting socket_vmnet on a live $IFACE"
+"$SUDO" -n /bin/launchctl kickstart -k "system/$VMNET_LABEL" >/dev/null ||
+  retry_later "could not restart socket_vmnet ($VMNET_LABEL)"
+waited=0
+until [ -S "$VMNET_SOCK" ] && [ "$(sock_id)" != "$old_sock" ]; do
+  [ "$waited" -lt 120 ] || retry_later "socket_vmnet did not come back at $VMNET_SOCK"
   sleep 2
   waited=$((waited + 2))
 done
 
 # --- start -------------------------------------------------------------------
-rm -f "$QMP"
+rm -f "$QMP" "$SERIAL" "$UNCORDONING"
 started=$SECONDS
 log "starting QEMU for '$NAME' ({{ vm_machine }}, {{ vm_cpus }} CPU, {{ vm_memory_mb }} MB)"
 # Device order matters: the NIC must be the first PCI device, or the guest sees
@@ -86,7 +132,7 @@ log "starting QEMU for '$NAME' ({{ vm_machine }}, {{ vm_cpus }} CPU, {{ vm_memor
   -name "$NAME" -uuid "{{ vm_uuid }}" \
   -machine {{ vm_machine }} -accel hvf -cpu host \
   -smp cpus={{ vm_cpus }},sockets=1,cores={{ vm_cpus }},threads=1 -m {{ vm_memory_mb }} \
-  -nodefaults -display none -vga none -monitor none -serial "file:$DIR/serial.log" \
+  -nodefaults -display none -vga none -monitor none -serial "file:$SERIAL" \
   -device virtio-net-pci,mac={{ vm_mac }},netdev=net0 -netdev socket,id=net0,fd=3 \
   -drive if=pflash,format=raw,unit=0,file="$DIR/edk2-aarch64-code.fd",readonly=on \
   -drive if=pflash,format=qcow2,unit=1,file="$DIR/efi_vars.fd" \
@@ -97,21 +143,49 @@ log "starting QEMU for '$NAME' ({{ vm_machine }}, {{ vm_cpus }} CPU, {{ vm_memor
 QPID=$!
 
 # --- stop --------------------------------------------------------------------
+STOPPING=""
 WATCHER=""
-stop_watcher() { [ -n "$WATCHER" ] && kill "$WATCHER" 2>/dev/null; }
 
-# ACPI power button, then wait for the guest to power itself off.
+# Stop the background watcher, including whatever it is running right now.
+# An uncordon in flight is allowed to finish, or it would race the cordon.
+# shellcheck disable=SC2329  # called from the traps below
+stop_watcher() {
+  { [ -n "$WATCHER" ] && kill -0 "$WATCHER" 2>/dev/null; } || return 0
+  if [ -e "$UNCORDONING" ]; then
+    log "letting the post-boot uncordon finish"
+    w=0
+    while kill -0 "$WATCHER" 2>/dev/null && [ "$w" -lt 60 ]; do
+      sleep 1
+      w=$((w + 1))
+    done
+  fi
+  kill -STOP "$WATCHER" 2>/dev/null
+  "$PKILL" -KILL -P "$WATCHER" 2>/dev/null
+  kill -KILL "$WATCHER" 2>/dev/null
+  rm -f "$UNCORDONING"
+  return 0
+}
+
+# ACPI power button, then wait for the guest to power itself off. If it does
+# not, QMP quit; if QEMU ignores that too, kill it.
 # shellcheck disable=SC2329  # called from the traps below
 power_off() {
   log "pressing the virtual power button (ACPI)"
   qmp system_powerdown
-
   waited=0
   while kill -0 "$QPID" 2>/dev/null; do
     if [ "$waited" -ge "$STOP_TIMEOUT" ]; then
       log "ERROR: guest still running after ${STOP_TIMEOUT}s; quitting QEMU (abrupt)"
       qmp quit
-      sleep 3
+      w=0
+      while kill -0 "$QPID" 2>/dev/null && [ "$w" -lt 10 ]; do
+        sleep 1
+        w=$((w + 1))
+      done
+      if kill -0 "$QPID" 2>/dev/null; then
+        log "ERROR: QEMU did not quit; killing it"
+        kill -KILL "$QPID" 2>/dev/null
+      fi
       break
     fi
     sleep 2
@@ -121,6 +195,8 @@ power_off() {
 
 # shellcheck disable=SC2329  # invoked through the trap below
 graceful_stop() {
+  STOPPING=1
+  trap '' USR1 # a person asked for a stop; a pending network restart must not undo it
   log "stop requested"
   stop_watcher
   if ctl ping >/dev/null 2>&1; then
@@ -136,27 +212,38 @@ graceful_stop() {
 }
 trap graceful_stop TERM INT HUP
 
-# Sent by the watcher below when the guest never reached the network. The guest
-# has no network, so there is nothing to cordon or snapshot; just power it off.
-# Exit 1 so launchd (KeepAlive on failure) starts the VM again.
+# Sent by the watcher when the guest booted but never reached the network. There
+# is nothing to cordon or snapshot without a network; just power it off and
+# exit 1 so launchd starts it again (preflight restarts socket_vmnet).
 # shellcheck disable=SC2329  # invoked through the trap below
 network_failed() {
+  [ -z "$STOPPING" ] || return 0
+  STOPPING=1
   power_off
   log "stopped after a network failure; launchd will start it again"
   exit 1
 }
 trap network_failed USR1
 
-# --- after boot: check the network, then undo the previous shutdown's cordon --
-# ping, not ssh, so a key problem is not mistaken for a network one.
+# --- after boot: network check, then undo the previous shutdown's cordon -----
+# "Booted" means the serial console reached its login prompt. Only a booted
+# guest that still does not answer ping counts as a network failure; a slow
+# boot (fsck, journal replay) is waited for, never powered off.
 RUNNER=$$
 (
-  until ping -c 1 -t 2 "$CP_HOST" >/dev/null 2>&1; do
-    if [ $((SECONDS - started)) -ge "$NET_TIMEOUT" ]; then
+  booted=""
+  until "$PING" -c 1 -t 2 "$GUEST_IP" >/dev/null 2>&1; do
+    if [ -z "$booted" ] && grep -q 'login: ' "$SERIAL" 2>/dev/null; then
+      booted=$SECONDS
+    fi
+    if [ -n "$booted" ] && [ $((SECONDS - booted)) -ge "$NET_TIMEOUT" ]; then
       echo $((net_fails + 1)) >"$NET_FAILS_FILE"
-      log "ERROR: guest not reachable after ${NET_TIMEOUT}s (failure $((net_fails + 1)) of $MAX_NET_FAILS); restarting socket_vmnet"
-      sudo -n /bin/launchctl kickstart -k "system/$VMNET_LABEL" || log "WARNING: could not restart socket_vmnet"
+      log "ERROR: guest booted but is not on the network after ${NET_TIMEOUT}s (failure $((net_fails + 1)) of $MAX_NET_FAILS)"
       kill -USR1 "$RUNNER"
+      exit 0
+    fi
+    if [ -z "$booted" ] && [ $((SECONDS - started)) -ge "$BOOT_TIMEOUT" ]; then
+      log "WARNING: guest has not booted after ${BOOT_TIMEOUT}s; leaving it running, nodes as they are (see $SERIAL)"
       exit 0
     fi
     sleep 3
@@ -165,13 +252,20 @@ RUNNER=$$
   log "guest is on the network"
 
   until ctl ready >/dev/null 2>&1; do
-    [ $((SECONDS - started)) -lt "$BOOT_TIMEOUT" ] || { log "API not ready after ${BOOT_TIMEOUT}s; leaving nodes as they are"; exit 0; }
+    [ $((SECONDS - started)) -lt "$BOOT_TIMEOUT" ] || {
+      log "API not ready after ${BOOT_TIMEOUT}s; leaving nodes as they are"
+      exit 0
+    }
     sleep 5
   done
   log "API ready; uncordoning nodes that the last shutdown cordoned"
+  touch "$UNCORDONING"
   ctl uncordon || log "WARNING: uncordon failed"
+  rm -f "$UNCORDONING"
 ) &
 WATCHER=$!
+# Out of the job table, so killing it does not dump its source into the log.
+disown "$WATCHER"
 
 # --- run until QEMU exits ----------------------------------------------------
 wait "$QPID"

@@ -856,16 +856,24 @@ NIC name, and a QMP `system_powerdown` makes the guest shut down cleanly.
 | `/opt/vm-runner/bin/vm-runner` | root-owned supervisor script |
 | `local.homelab.vm-runner` | boot-time LaunchDaemon that runs it as `_vmrunner` |
 
-**Start:** preflight, QEMU through `socket_vmnet_client`, then, once the API
-answers, `vm-ctl uncordon` releases nodes the last shutdown cordoned.
-**No network:** `socket_vmnet` can hang while setting up vmnet after a reboot
-(its log stops at `Using network interface "en0"`) while its socket file still
-exists, so the VM boots unreachable. If the guest does not answer ping within
-180 s, the runner restarts `socket_vmnet` (its only sudo right, in
-`/etc/sudoers.d/vm-runner`), powers the guest off and exits 1, and launchd starts
-it again. After three such starts in a row it stops and logs `NOT STARTING`;
-fix the cause, then `sudo rm /opt/vm-runner/controlplane/net-failures` and
-kickstart it.
+**Start:** preflight, wait for `en0` to have an address, restart `socket_vmnet`
+and wait for its fresh socket, then QEMU through `socket_vmnet_client`. Once the
+guest answers ping and the API is ready, `vm-ctl uncordon` releases the nodes
+the last shutdown cordoned. The restart is there because, after a reboot,
+`socket_vmnet` can hang while setting up vmnet (its log stops at `Using network
+interface "en0"`) with its socket file still in place, and a VM started on it
+has no network. Restarting it is the runner's only sudo right
+(`/etc/sudoers.d/vm-runner`). The runner reaches the guest by IP, resolved when
+the playbook runs (`vm_guest_ip` overrides it), so DNS is not needed at boot.
+**No network anyway:** if the guest reaches its serial login prompt but still
+does not answer ping 120 s later, the runner powers it off and exits 1, and
+launchd starts it again. A guest that is only slow to boot (no login prompt yet)
+is left alone. After three such starts in a row it stops and logs
+`NOT STARTING`; fix the cause, then
+`sudo rm /opt/vm-runner/controlplane/net-failures` and kickstart it.
+**Not ready yet** (`en0` without an address, `socket_vmnet` not back): exits 1,
+and launchd tries again every 30 s. Problems a person has to fix (missing VM
+files, another QEMU or UTM VM running) log `NOT STARTING` and stay off.
 **Stop** (SIGTERM from launchd at restart or shutdown): `vm-ctl cordon`, `vm-ctl
 snapshot` (verified etcd snapshot shipped to the NAS), then the virtual power
 button (ACPI) and a wait for the guest to power itself off. It takes about two
@@ -936,7 +944,7 @@ stale, and cloning it would throw that state away.
    ```bash
    ansible-playbook -i inventory/hosts.yml playbooks/vm-runner.yml -K -e vm_runner_load=true
    ```
-4. Check: `tail -f /opt/vm-runner/controlplane/runner.log`, then `kubectl get nodes`.
+4. Check: `sudo tail -f /opt/vm-runner/controlplane/runner.log`, then `kubectl get nodes`.
 
 **From then on the QEMU VM is the source of truth.** The original UTM disk is
 stale and must not be started casually: it would share the MAC and IP with the
@@ -951,12 +959,15 @@ finish), then start the UTM VM, which still holds the pre-cutover disk.
 ```bash
 sudo launchctl kill TERM system/local.homelab.vm-runner   # graceful stop (cordon, snapshot, ACPI)
 sudo launchctl kickstart system/local.homelab.vm-runner   # start it again
-tail -f /opt/vm-runner/controlplane/runner.log                   # supervisor
-tail -f /opt/vm-runner/controlplane/serial.log                   # guest firmware/serial output
+sudo tail -f /opt/vm-runner/controlplane/runner.log      # supervisor
+sudo tail -f /opt/vm-runner/controlplane/serial.log      # guest firmware/serial output
 ```
 
-A clean guest poweroff, or a stop as above, exits 0 and stays off; launchd only
-restarts the job if QEMU or the supervisor fails. Stop it before upgrading
+The runner's directory is `0700`, so reading its logs needs `sudo`. A clean guest
+poweroff, or a stop as above, exits 0 and stays off; launchd only restarts the
+job if QEMU or the supervisor fails. Rerunning the playbook with
+`vm_runner_load=true` only reloads the daemon (a full graceful stop and start)
+when its plist changed; a changed script takes effect at the next start. Stop it before upgrading
 Homebrew's QEMU, and check `qemu-system-aarch64 -machine help` still lists the
 pinned `vm_machine` afterwards.
 
@@ -972,9 +983,10 @@ pinned `vm_machine` afterwards.
   `staff`, so any of them can join `en0` at layer 2. Tighten it with a dedicated
   group if `socket_vmnet --help` offers one.
 - **Only the start is watched for network loss.** If `socket_vmnet` dies while
-  the VM is running, nothing notices; restart both by hand
-  (`sudo launchctl kickstart -k system/io.github.lima-vm.socket_vmnet.bridged.en0`,
-  then stop and start the runner).
+  the VM is running, nothing notices; stop and start the runner (its start
+  restarts `socket_vmnet` too).
+- **The guest's IP is fixed at install time.** It comes from the DHCP lease the
+  MAC pins; if that ever moves, rerun the playbook or set `vm_guest_ip`.
 - **The shutdown is best effort at a system shutdown**: macOS can cut a daemon's
   `ExitTimeOut` short. The 6-hourly etcd snapshot timer is the backstop.
 

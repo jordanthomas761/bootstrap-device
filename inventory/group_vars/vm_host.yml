@@ -66,9 +66,15 @@ vm_runner_load: false
 vm_qemu_bin: /opt/homebrew/bin/qemu-system-aarch64
 vm_socket_vmnet_client: /opt/socket_vmnet/bin/socket_vmnet_client
 vm_socket_vmnet_socket: /var/run/socket_vmnet.bridged.en0
-# Its LaunchDaemon. The runner may restart exactly this job, through one
-# sudoers rule, when the guest comes up with no network (see below).
+# Its LaunchDaemon. The runner restarts exactly this job before every start,
+# through one sudoers rule: after a reboot it can hang setting up vmnet.
 vm_socket_vmnet_label: io.github.lima-vm.socket_vmnet.bridged.en0
+# The Mac interface it bridges; the runner waits for it to have an address.
+vm_host_iface: en0
+# The runner reaches the guest by IP so a resolver that is not up at boot does
+# not look like a dead network. Empty: resolve cluster_cp_host on the Mac when
+# the playbook runs (the MAC pins the DHCP lease). Set it if the lease moves.
+vm_guest_ip: ""
 
 # The VM's identity, copied from the UTM VM it replaces (`ps` on the running UTM
 # QEMU, or its config.plist). Keep them identical: the MAC fixes the DHCP lease,
@@ -90,10 +96,11 @@ vm_runner_stop_timeout: 240
 vm_runner_exit_timeout: 300
 # How long to wait for the API after boot before giving up on the auto-uncordon.
 vm_runner_boot_timeout: 600
-# The guest normally answers ping ~20 s after QEMU starts. If it has not after
-# this long, the network path is broken (socket_vmnet can hang after a reboot
-# while its socket file still exists): the runner restarts socket_vmnet, powers
-# the guest off and exits non-zero so launchd starts it again. After this many
-# such starts in a row it stops trying and waits for a person.
-vm_runner_net_timeout: 180
+# Once the guest's serial console shows its login prompt, it should answer ping
+# within seconds. If it still has not after this long, the network path is
+# broken: the runner powers the guest off and exits non-zero so launchd starts it
+# again on a freshly restarted socket_vmnet. A guest still booting (no login
+# prompt yet) is never treated this way. After this many such starts in a row
+# it stops trying and waits for a person.
+vm_runner_net_timeout: 120
 vm_runner_max_net_failures: 3
