@@ -911,7 +911,7 @@ stale, and cloning it would throw that state away.
    hand-started QEMU, whose firmware copy already matches its EFI variables:
    ```bash
    SRC=~/vm-spike
-   D=/var/vm/controlplane
+   D=/opt/vm-runner/controlplane
    sudo cp -c "$SRC/control-plane.qcow2" "$D/disk.qcow2"
    sudo cp -c "$SRC/efi_vars.fd" "$D/efi_vars.fd"
    sudo cp -c "$SRC/edk2-aarch64-code.fd" "$D/"
@@ -928,7 +928,7 @@ stale, and cloning it would throw that state away.
    ```bash
    ansible-playbook -i inventory/hosts.yml playbooks/vm-runner.yml -K -e vm_runner_load=true
    ```
-4. Check: `tail -f /var/vm/controlplane/runner.log`, then `kubectl get nodes`.
+4. Check: `tail -f /opt/vm-runner/controlplane/runner.log`, then `kubectl get nodes`.
 
 **From then on the QEMU VM is the source of truth.** The original UTM disk is
 stale and must not be started casually: it would share the MAC and IP with the
@@ -943,8 +943,8 @@ finish), then start the UTM VM, which still holds the pre-cutover disk.
 ```bash
 sudo launchctl kill TERM system/local.homelab.vm-runner   # graceful stop (cordon, snapshot, ACPI)
 sudo launchctl kickstart system/local.homelab.vm-runner   # start it again
-tail -f /var/vm/controlplane/runner.log                   # supervisor
-tail -f /var/vm/controlplane/serial.log                   # guest firmware/serial output
+tail -f /opt/vm-runner/controlplane/runner.log                   # supervisor
+tail -f /opt/vm-runner/controlplane/serial.log                   # guest firmware/serial output
 ```
 
 A clean guest poweroff, or a stop as above, exits 0 and stays off; launchd only

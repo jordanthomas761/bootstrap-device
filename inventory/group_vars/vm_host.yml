@@ -50,10 +50,12 @@ vm_hook_exit_timeout: 240
 vm_runner_user: _vmrunner
 vm_runner_uid: 399
 vm_runner_group: staff
-vm_runner_home: /var/vm
+# Not under /var: /private/var/vm belongs to macOS (swap and sleep image) and
+# was cleared by a restart, taking the VM disk with it.
+vm_runner_home: /opt/vm-runner
 # Disk, EFI variables, firmware copy, QMP socket, serial log and the runner's
 # own ssh key all live here. 0750, owned by the runner.
-vm_runner_dir: /var/vm/controlplane
+vm_runner_dir: /opt/vm-runner/controlplane
 # Root-owned, so the service user cannot rewrite the script launchd runs.
 vm_runner_bin_dir: /opt/vm-runner/bin
 vm_runner_label: local.homelab.vm-runner

@@ -10,7 +10,7 @@
 # WHAT IT SETS UP
 #
 #   - an unprivileged, hidden service user (vm_runner_user) with no login shell
-#   - /var/vm/controlplane (disk, EFI variables, firmware copy, QMP socket,
+#   - /opt/vm-runner/controlplane (disk, EFI variables, firmware copy, QMP socket,
 #     serial log, the runner's own ssh key), owned by that user
 #   - a root-owned supervisor script and a boot-time LaunchDaemon that runs it
 #     as the service user
